@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>자동화</title>
+  <link rel="stylesheet" href="/static/layout.css" />
+</head>
+<body>
+  <header class="bar">
+    <p class="bar__name">로컬 LLM</p>
+  </header>
+
+  <main class="page" id="appMain" hidden>
+    <div class="gds-heading">
+      <p class="gds-heading__title">자동화</p>
+      <span class="gds-heading__side-action">
+        <button type="button" class="gds-button gds-button--small" id="addBtn">추가</button>
+        <button type="button" class="gds-button gds-button--secondary gds-button--small" id="openInstall">설치</button>
+      </span>
+    </div>
+    <div id="jobList" class="jobs"></div>
+  </main>
+
+  <div class="modal" id="editModal" hidden>
+    <div class="sheet">
+      <div class="gds-heading">
+        <p class="gds-heading__title" id="editTitle">추가</p>
+        <button type="button" class="gds-button gds-button--secondary gds-button--small" data-close="editModal">닫기</button>
+      </div>
+      <div class="stack">
+        <div class="gds-text-field gds-text-field--small">
+          <input id="title" class="gds-text-field__input" placeholder="제목 (없어도 됨)" />
+        </div>
+        <div id="modelDrop"></div>
+        <textarea id="prompt" class="note" placeholder="예: 오늘 할 일을 세 줄로 요약해 줘."></textarea>
+        <div id="effortDrop"></div>
+        <div id="permissionDrop"></div>
+        <div id="loopsDrop"></div>
+        <div id="presetDrop"></div>
+        <div class="when" id="whenWrap" hidden>
+          <div id="repeatDrop"></div>
+          <div class="gds-text-field gds-text-field--small">
+            <input id="whenTime" class="gds-text-field__input" type="time" value="17:00" />
+          </div>
+        </div>
+        <div id="alertDrop"></div>
+        <div class="row">
+          <button class="gds-button gds-button--cta" id="tryBtn" type="button">지금 실행해보기</button>
+          <button class="gds-button gds-button--secondary" id="saveBtn" type="button">저장</button>
+        </div>
+        <pre class="log" id="tryOut"></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="installModal" hidden>
+    <div class="sheet">
+      <div class="gds-heading">
+        <p class="gds-heading__title">설치</p>
+        <button type="button" class="gds-button gds-button--secondary gds-button--small" id="installClose" data-close="installModal" hidden>닫기</button>
+      </div>
+      <p class="legend" id="hwLine"></p>
+      <div class="gds-heading"><p class="gds-heading__title">받을 항목</p></div>
+      <p class="legend">예약은 Ollama가 백그라운드에서 합니다. llama.cpp는 필수가 아닙니다. 숫자는 그 모델의 디스크·램입니다.</p>
+      <div class="stack">
+        <div id="providerDrop"></div>
+        <div id="lightDrop"></div>
+        <div id="reasonDrop"></div>
+        <div id="agentDrop"></div>
+      </div>
+      <p class="legend">글만 요약·답하는 일은 모델만 있으면 됩니다. MCP, CLI, 하네스, 반복 스킬을 입히려면 도구 에이전트가 필요합니다.</p>
+      <p class="legend" id="hint"></p>
+      <div class="row">
+        <button class="gds-button gds-button--cta" id="installBtn" type="button">받기</button>
+      </div>
+      <div class="progress" id="progress" hidden>
+        <div class="spin" aria-hidden="true"></div>
+        <p class="progress__title" id="progressTitle">받는 중</p>
+        <p class="progress__what" id="progressWhat"></p>
+        <div class="progress__bar"><i id="progressBar"></i></div>
+        <p class="progress__pct" id="progressPct">0%</p>
+        <p class="progress__err" id="progressErr" hidden></p>
+        <button type="button" class="gds-button gds-button--secondary" id="cancelBtn">취소</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/dropdown.js"></script>
+  <script src="/static/catalog.js"></script>
+  <script src="/static/jobs.js"></script>
+</body>
+</html>

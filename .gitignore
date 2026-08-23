@@ -1,0 +1,7 @@
+data/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+static/gds.css
+static/fonts/
