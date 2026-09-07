@@ -1,6 +1,7 @@
 """Execution boundaries: no real credentials, remote services, or external agents."""
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -130,6 +131,47 @@ class ToolSafetyTest(unittest.TestCase):
             self.assertIsNone(outside.poll())
         finally:
             outside.terminate(); outside.wait(timeout=5)
+
+    def test_runtime_roots_cover_only_selected_python_installation(self):
+        prefix = self.root / 'hostedtoolcache/Python/3.12/arm64'
+        interpreter = prefix / 'bin/python3'
+        with patch.object(sys, 'executable', str(interpreter)), patch.object(sys, 'base_prefix', str(prefix)):
+            roots = tools._runtime_paths_for(interpreter)
+            self.assertIn(prefix, roots)
+            unrelated = self.root / 'other/bin/custom'
+            self.assertEqual(tools._runtime_paths_for(unrelated), [unrelated])
+        version = self.root / 'Library/Frameworks/Python.framework/Versions/3.12'
+        framework_python = version / 'Resources/Python.app/Contents/MacOS/Python'
+        roots = tools._runtime_paths_for(framework_python)
+        self.assertIn(version, roots)
+        self.assertNotIn(version.parent, roots)
+        self.assertNotIn(self.root / 'Library/Frameworks', roots)
+
+    @unittest.skipUnless(sys.platform == 'darwin' and Path('/usr/bin/sandbox-exec').exists(), 'macOS kernel sandbox')
+    def test_framework_runtime_is_readonly_and_does_not_open_siblings_or_credentials(self):
+        version = self.root / 'Library/Frameworks/Python.framework/Versions/3.12'
+        executable = version / 'bin/python3'
+        runtime = version / 'lib/python3.12/fixture'
+        credential = version / '.ssh/fixture'
+        sibling = version.parent / '3.11/fixture'
+        for path in (executable, runtime, credential, sibling):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        runtime.write_text('RUNTIME_FIXTURE\n')
+        credential.write_text('CREDENTIAL_FIXTURE\n')
+        sibling.write_text('SIBLING_FIXTURE\n')
+        script = '#!/bin/sh\n/bin/cat ' + shlex.quote(str(runtime)) + '\n'
+        for denied in (credential, sibling):
+            script += ('if /bin/cat ' + shlex.quote(str(denied)) + ' 2>/dev/null; '
+                       'then /bin/echo ESCAPED; else /bin/echo DENIED; fi\n')
+        script += ('if ( /bin/echo changed > ' + shlex.quote(str(runtime)) + ' ) 2>/dev/null; '
+                   'then /bin/echo WROTE; else /bin/echo READ_ONLY; fi\n')
+        executable.write_text(script)
+        executable.chmod(0o700)
+        with patch.object(Path, 'home', return_value=version):
+            result = tools.sandbox_run([str(executable)], 'workspace', 5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['RUNTIME_FIXTURE', 'DENIED', 'DENIED', 'READ_ONLY'])
+        self.assertEqual(runtime.read_text(), 'RUNTIME_FIXTURE\n')
 
     def test_agent_environment_cannot_replace_sandbox_environment(self):
         for env in ({'HOME': '/tmp'}, {'PATH': '/tmp'}, {'API_KEY': 'not-a-real-key'}):

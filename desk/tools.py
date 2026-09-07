@@ -495,6 +495,32 @@ def _sandbox_profile(permission: str, workspace: Path, scratch: Path, allow_olla
     return '\n'.join(rules)
 
 
+def _runtime_paths_for(executable: Path) -> list[Path]:
+    """Read-only runtime roots for the selected executable, never its arbitrary parent."""
+    executable = executable.resolve()
+    paths = [executable]
+    if executable == Path(sys.executable).resolve():
+        # setup-python may install an interpreter/stdlib outside Homebrew or /usr.
+        paths.append(Path(sys.base_prefix).resolve())
+    for parent in executable.parents:
+        if parent.name == 'Python.framework':
+            relative = executable.relative_to(parent)
+            if len(relative.parts) >= 3 and relative.parts[0] == 'Versions':
+                paths.append(parent / 'Versions' / relative.parts[1])
+            break
+    uv_root = Path.home() / '.local/share/uv/tools'
+    try:
+        relative = executable.relative_to(uv_root)
+        paths += [uv_root / relative.parts[0], Path.home() / '.local/share/uv/python']
+    except ValueError:
+        pass
+    for parent in executable.parents:
+        if parent.suffix == '.app':
+            paths.append(parent)
+            break
+    return list(dict.fromkeys(paths))
+
+
 def sandbox_run(argv: list[str], permission: str, timeout: float, *, allow_ollama: bool = False,
                 extra_env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess:
     """Execute argv in a macOS kernel sandbox; unsupported platforms fail closed.
@@ -522,17 +548,7 @@ def sandbox_run(argv: list[str], permission: str, timeout: float, *, allow_ollam
     with tempfile.TemporaryDirectory(prefix='desk-cli-') as temp:
         scratch = Path(temp).resolve()
         resolved_executable = Path(executable).resolve()
-        runtime_paths = [resolved_executable]
-        uv_root = Path.home() / '.local/share/uv/tools'
-        try:
-            relative = resolved_executable.relative_to(uv_root)
-            runtime_paths += [uv_root / relative.parts[0], Path.home() / '.local/share/uv/python']
-        except ValueError:
-            pass
-        for parent in resolved_executable.parents:
-            if parent.suffix == '.app':
-                runtime_paths.append(parent)
-                break
+        runtime_paths = _runtime_paths_for(resolved_executable)
         profile = _sandbox_profile(permission, workspace, scratch, allow_ollama, runtime_paths)
         env = {'PATH': connectors_mod._cli_path(), 'HOME': str(scratch), 'TMPDIR': str(scratch),
                'LANG': 'en_US.UTF-8', 'TERM': 'dumb', **extra_env}
