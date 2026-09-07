@@ -5,6 +5,7 @@ permissions:
 jobs:
   python:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ['3.10', '3.13']

@@ -140,7 +140,10 @@ class DiscoverTest(HermeticCase):
             by_source.setdefault(c["source"], []).append(c)
         codex = {c["name"] for c in by_source.get("codex", [])}
         claude = {c["name"]: c for c in by_source.get("claude-code", [])}
-        self.assertTrue({"kakaopay", "node_repl"} <= codex, f"codex candidates: {codex}")
+        if connectors.tomllib is not None:
+            self.assertTrue({"kakaopay", "node_repl"} <= codex, f"codex candidates: {codex}")
+        else:
+            self.assertNotIn("codex", by_source)
         self.assertIn("dingtalk", claude)
         self.assertEqual(claude["dingtalk"]["transport"], "http")
         self.assertIn("pricing-brain", claude)
@@ -152,16 +155,21 @@ class DiscoverTest(HermeticCase):
             self.assertNotIn("headers", c)
         self.assertEqual(claude["dingtalk"]["url"].split("?")[1], "<redacted>")
         self.assertIn("?key=", connectors.resolve_url(claude["dingtalk"]))  # 실행 시에만 origin 에서 복원
-        kakaopay = next(c for c in by_source["codex"] if c["name"] == "kakaopay")
-        self.assertIn("KAKAOPAY_SECRET_KEY", kakaopay["env_keys"])
-        # env 값 유출 확인: 실제 값이 dump 에 없어야 한다
-        env = connectors.resolve_env(kakaopay)
-        for value in env.values():
-            if len(value) >= 6:
-                self.assertNotIn(value, dump)
+        if connectors.tomllib is not None:
+            kakaopay = next(c for c in by_source["codex"] if c["name"] == "kakaopay")
+            self.assertIn("KAKAOPAY_SECRET_KEY", kakaopay["env_keys"])
+            # env 값 유출 확인: 실제 값이 dump 에 없어야 한다
+            env = connectors.resolve_env(kakaopay)
+            for value in env.values():
+                if len(value) >= 6:
+                    self.assertNotIn(value, dump)
         self.assertLessEqual(len(cands), connectors.MAX_CANDIDATES)
         kinds = [c["kind"] for c in cands]
         self.assertEqual(kinds, sorted(kinds, key=connectors.KINDS.index))
+
+    def test_discovery_without_toml_parser_preserves_other_sources(self) -> None:
+        with patch.object(connectors, "tomllib", None):
+            self.test_discover_fixture_configs()
 
     def test_public_redacts(self) -> None:
         con = {"id": "c1", "kind": "mcp", "name": "d", "transport": "http", "url": "https://x.y/z?key=SECRET",
