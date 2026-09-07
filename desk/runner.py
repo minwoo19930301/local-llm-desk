@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -36,7 +37,6 @@ DEFAULT_DEFER_MIN = 30
 DEFER_POLL_S = 30
 ONCE_GRACE_MIN = 10
 MAX_LOOPS = 32
-TOOL_MIN_LOOPS = 8
 TRIM_HEAD = 800
 TRIM_TAIL = 800
 RUNS_MAX_BYTES = 5 * 1024 * 1024
@@ -64,9 +64,9 @@ class Budget:
         if self.remaining() <= 0:
             raise RuntimeError("시간 예산 초과")
 
-    def chat_timeout(self, effort: str) -> int:
+    def chat_timeout(self, effort: str) -> float:
         self.check()
-        return max(5, int(min(self.remaining(), int(ollama_ctl.effort_knobs(effort)["timeout"]))))
+        return max(0.001, min(self.remaining(), float(ollama_ctl.effort_knobs(effort)["timeout"])))
 
 
 @dataclass
@@ -200,6 +200,10 @@ def run_job(job_id: str, scheduled: bool = False, wait: bool = True) -> dict:
         _persist(job_id, result)
         return result
     ctx = RunContext.from_job(job)
+    if scheduled and not job.get("enabled", True):
+        result = _record(ctx, "skipped", error="비활성화된 자동화")
+        _persist(job_id, result)
+        return result
     stale = _stale_once_reason(job) if scheduled else None
     if stale:
         result = _record(ctx, "skipped", error=stale)
@@ -213,11 +217,11 @@ def run_job(job_id: str, scheduled: bool = False, wait: bool = True) -> dict:
     try:
         _write_active(ctx)
         result = _run_gated(ctx, wait)
+        _finish(job, ctx, result)
+        return result
     finally:
         _clear_active(ctx.pid)
         lock.release()
-    _finish(job, ctx, result)
-    return result
 
 
 def _stale_once_reason(job: dict[str, Any]) -> str | None:
@@ -386,9 +390,24 @@ def run_task(
         return _desk_run(model, prompt, effort, permission, max_loops, tools, connectors, num_ctx, budget)
     if agent == "aider":
         argv = ["aider", "--yes", "--no-auto-commits", "--model", f"ollama_chat/{model}", "-m", prompt]
-        return TaskResult(text=_run_cli("aider", argv, permission, budget), tools_used=["aider"], loops=1)
+        return TaskResult(text=_run_cli("aider", argv, permission, budget,
+                                       extra_env={"OLLAMA_API_BASE": ollama_ctl.OLLAMA_HOST}), tools_used=["aider"], loops=1)
     if agent == "opencode":
-        return TaskResult(text=_run_cli("opencode", ["opencode", "run", prompt], permission, budget), tools_used=["opencode"], loops=1)
+        # Inline config overrides user/project defaults; only the selected local
+        # provider is enabled. No cloud credentials or global config are needed.
+        config = {
+            "enabled_providers": ["ollama"],
+            "model": f"ollama/{model}",
+            "small_model": f"ollama/{model}",
+            "provider": {"ollama": {
+                "npm": "@ai-sdk/openai-compatible", "name": "Ollama (local)",
+                "options": {"baseURL": ollama_ctl.OLLAMA_HOST + "/v1"},
+                "models": {model: {"name": model}},
+            }},
+        }
+        argv = ["opencode", "run", "--model", f"ollama/{model}", prompt]
+        return TaskResult(text=_run_cli("opencode", argv, permission, budget,
+                                       extra_env={"OPENCODE_CONFIG_CONTENT": json.dumps(config)}), tools_used=["opencode"], loops=1)
     raise RuntimeError(f"에이전트 '{agent}'를 이 작업에서 아직 못 돌립니다.")
 
 
@@ -410,9 +429,9 @@ def _desk_run(
     ctx_len = int(num_ctx or ollama_ctl.effort_knobs(effort)["num_ctx"])
     if not wanted and not cons:
         payload = ollama_ctl.chat(model, prompt, effort=effort, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
-        return TaskResult(text=ollama_ctl.extract_text(payload) or "(빈 응답)", loops=1)
+        return TaskResult(text=ollama_ctl.extract_text(payload), loops=1)
 
-    loops = max(TOOL_MIN_LOOPS, _int(max_loops, 1, 1, MAX_LOOPS))
+    loops = _int(max_loops, 1, 1, MAX_LOOPS)
     skills = [c for c in cons if c.get("kind") == "skill"]
     mcp_cons = [c for c in cons if c.get("kind") == "mcp"]
     clients: dict = {}
@@ -422,7 +441,8 @@ def _desk_run(
             from desk import mcp_host as host
 
             clients = host.open_for_job(mcp_cons)
-        spec = tools.specs(permission, wanted, cons, clients)
+        tool_context = tools.build_context(permission, wanted, cons, clients)
+        spec = tool_context.specifications
         system = tools.system_prompt(permission, loops, skills) + _mcp_instructions(clients)
         messages: list[dict] = [
             {"role": "system", "content": system},
@@ -439,18 +459,18 @@ def _desk_run(
             messages.append(msg)
             calls = ollama_ctl.extract_tool_calls(payload)
             if not calls:
-                result.text = result.text or "(빈 응답)"
                 return result
             for call in calls:
                 budget.check()
-                output = tools.run(call["name"], call.get("arguments") or {}, permission, clients, timeout=budget.remaining())
+                output = tools.run(call["name"], call.get("arguments") or {}, permission, clients,
+                                   timeout=budget.remaining(), context=tool_context)
                 result.note_tool(call["name"])
                 messages.append(_tool_message(call, output))
             if _trim_transcript(messages, ctx_len):
                 result.truncated = True
         payload = ollama_ctl.chat_messages(model, messages, effort=effort, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
         result.loops += 1
-        result.text = ollama_ctl.extract_text(payload) or result.text or "(빈 응답)"
+        result.text = ollama_ctl.extract_text(payload)
         return result
     finally:
         if host is not None:
@@ -494,19 +514,18 @@ def _transcript_chars(messages: list[dict]) -> int:
     return sum(len(str(m.get("content") or "")) for m in messages)
 
 
-def _run_cli(name: str, argv: list[str], permission: str, budget: Budget) -> str:
+def _run_cli(name: str, argv: list[str], permission: str, budget: Budget, *, extra_env: dict[str, str] | None = None) -> str:
     """aider/opencode. 읽기 권한이면 거절, 작업 폴더는 권한에 따라, timeout은 남은 예산."""
     import shutil
+    from desk.tools import sandbox_run
 
     if permission == "read":
         raise RuntimeError(f"읽기 권한에서는 {name}를 실행하지 않습니다.")
     if not shutil.which(argv[0]):
         raise RuntimeError(f"{name}가 이 맥에 없습니다. 설치에서 받으세요.")
-    cwd = Path.home() if permission == "machine" else WORKSPACE
-    cwd.mkdir(parents=True, exist_ok=True)
     budget.check()
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=max(30, int(budget.remaining())), cwd=str(cwd))
+        proc = sandbox_run(argv, permission, timeout=budget.remaining(), allow_ollama=True, extra_env=extra_env)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("시간 예산 초과") from exc
     out = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
@@ -737,28 +756,56 @@ def _pid_alive(pid: int) -> bool:
 
 
 class JobLock:
-    """data/pids/job-<id>.pid. 살아 있는 pid면 획득 실패, 죽은 pid면 이전 실행을 '중단됨'으로 정리."""
+    """Stable flock inode excludes both HTTP threads and cron processes.
+
+    The separate PID file records crashes; the lock file must never be unlinked.
+    """
 
     def __init__(self, job_id: str) -> None:
         self.job_id = job_id
         self.path = PID_DIR / f"job-{job_id}.pid"
+        self.lock_path = PID_DIR / f"job-{job_id}.lock"
+        self._handle = None
+        self._owner_pid = None
 
     def acquire(self) -> bool:
         PID_DIR.mkdir(parents=True, exist_ok=True)
-        previous = self._read()
-        if previous and previous != os.getpid() and _pid_alive(previous):
+        if self._handle is not None:
             return False
-        if previous and not _pid_alive(previous):
-            self._record_aborted(previous)
-        self.path.write_text(str(os.getpid()), encoding="utf-8")
+        handle = self.lock_path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return False
+        try:
+            previous = self._read()
+            if previous and not _pid_alive(previous):
+                self._record_aborted(previous)
+            self.path.write_text(str(os.getpid()), encoding="utf-8")
+        except BaseException:
+            handle.close()
+            raise
+        self._handle = handle
+        self._owner_pid = os.getpid()
         return True
 
     def release(self) -> None:
-        if self._read() == os.getpid():
+        if self._handle is None or self._owner_pid != os.getpid():
+            return
+        try:
+            if self._read() == os.getpid():
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+        finally:
             try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._handle.close()
+                self._handle = None
+                self._owner_pid = None
 
     def _read(self) -> int | None:
         try:

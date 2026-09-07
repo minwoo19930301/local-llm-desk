@@ -8,13 +8,14 @@ is never touched.
 from __future__ import annotations
 
 import subprocess
+import shlex
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from desk import crontab_sync, http_api, jobs, state
+from desk import connectors, crontab_sync, http_api, jobs, state
 
 
 class TempData(unittest.TestCase):
@@ -24,6 +25,8 @@ class TempData(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
         self.patches = [
+            mock.patch.object(state, "ensure_dirs"),
+            mock.patch.object(connectors, "load", return_value=[{"id": "c1"}]),
             mock.patch.object(state, "JOBS_FILE", base / "jobs.json"),
             mock.patch.object(state, "CONFIG_FILE", base / "config.json"),
             mock.patch.object(state, "LOCK_FILE", base / ".lock"),
@@ -66,7 +69,13 @@ class NormalizeKnobs(unittest.TestCase):
         self.assertEqual(jobs.normalize_knobs({"max_loops": 999})["max_loops"], 32)
 
     def test_connectors_dedupe(self) -> None:
-        self.assertEqual(jobs.normalize_knobs({"connectors": ["a", " a ", "b", ""]})["connectors"], ["a", "b"])
+        with mock.patch.object(connectors, "load", return_value=[{"id": "a"}, {"id": "b"}]):
+            self.assertEqual(jobs.normalize_knobs({"connectors": ["a", " a ", "b", ""]})["connectors"], ["a", "b"])
+
+    def test_unknown_connector_is_rejected(self) -> None:
+        with mock.patch.object(connectors, "load", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "등록되지 않은 연동"):
+                jobs.normalize_knobs({"connectors": ["missing"]})
 
 
 class CreateUpdate(TempData):
@@ -183,6 +192,17 @@ class Crontab(unittest.TestCase):
         self.assertIn("# 50 off", new)
         self.assertNotIn("%", new.split(crontab_sync.BEGIN)[1])
         self.assertEqual(crontab_sync.compose(existing, []), "0 1 * * * echo hi\n")
+
+    def test_command_preserves_paths_with_spaces_quotes_and_percent(self) -> None:
+        wrapper = Path("/tmp/Team's 50% projects/desk/cron_wrap.sh")
+        python = "/tmp/Python 3/bin/python"
+        with mock.patch.object(crontab_sync, "CRON_WRAP", wrapper), mock.patch.object(crontab_sync.sys, "executable", python):
+            block = crontab_sync.managed_block([{"id": "abc", "enabled": True, "cron": "0 9 * * *"}])
+        command = next(line for line in block.splitlines() if line.startswith("0 9 ")).split(maxsplit=5)[5]
+        self.assertIn(r"\%", command)
+        # cron removes the escape before passing the command to its shell.
+        argv = shlex.split(command.replace(r"\%", "%"), comments=True)
+        self.assertEqual(argv, [f"DESK_PYTHON={python}", str(wrapper), "abc"])
 
     def test_invalid_cron_skipped(self) -> None:
         block = crontab_sync.managed_block([{"id": "j", "enabled": True, "cron": "99 99 * * *", "title": "t"}])

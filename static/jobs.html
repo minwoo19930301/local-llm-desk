@@ -152,6 +152,19 @@
           </div>
         </div>
         <div id="permissionDrop"></div>
+        <details class="execution-options">
+          <summary>실행 시간과 메모리 설정</summary>
+          <div class="stack">
+            <label for="maxMinutes">최대 실행 시간 (분)</label>
+            <input id="maxMinutes" class="gds-text-field__input" type="number" min="1" max="720" value="30" />
+            <div id="ramPolicyDrop"></div>
+            <div id="deferWrap" class="stack">
+              <label for="deferMax">메모리가 부족하면 기다릴 시간 (분)</label>
+              <input id="deferMax" class="gds-text-field__input" type="number" min="1" max="720" value="30" />
+            </div>
+            <div id="fallbackWrap" hidden><div id="fallbackModelDrop"></div></div>
+          </div>
+        </details>
         <div id="presetDrop"></div>
         <div class="when" id="whenWrap" hidden>
           <div class="gds-text-field gds-text-field--small" id="timeWrap">

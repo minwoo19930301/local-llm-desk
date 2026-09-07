@@ -8,6 +8,7 @@ existing crontab reliably.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 from typing import Any
@@ -75,13 +76,15 @@ def managed_block(jobs: list[dict[str, Any]]) -> str:
         BEGIN,
         "SHELL=/bin/zsh",
         "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
-        f"DESK_PYTHON={sys.executable}",
     ]
     for job in jobs:
         cron = (job.get("cron") or "").strip()
         if not job.get("enabled") or not valid_cron(cron):
             continue
-        lines.append(f"{cron} {CRON_WRAP} {job['id']}  # {_comment(job.get('title') or '')}")
+        command = f"DESK_PYTHON={shlex.quote(sys.executable)} {shlex.quote(str(CRON_WRAP))} {shlex.quote(str(job['id']))}"
+        # cron processes percent signs before the shell, even inside quotes.
+        command = command.replace("%", r"\%")
+        lines.append(f"{cron} {command}  # {_comment(job.get('title') or '')}")
     lines.append(END)
     return "\n".join(lines) + "\n"
 

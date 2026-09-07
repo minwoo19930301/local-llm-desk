@@ -32,6 +32,7 @@ const STATUS_LABEL = {
   skipped: "건너뜀",
   deferred_timeout: "시간초과",
   aborted: "중단됨",
+  empty: "빈 응답",
 };
 
 const KIND_LABEL = { mcp: "MCP", cli: "CLI", http: "HTTP", skill: "스킬" };
@@ -53,8 +54,13 @@ const CTX_BY_EFFORT = { low: 4096, medium: 8192, high: 16384 };
 const FORM = {
   permission: [
     { id: "read", name: "읽기만 · 조회" },
-    { id: "workspace", name: "이 앱이 있는 폴더만", selected: true },
-    { id: "machine", name: "이 컴퓨터 전체" },
+    { id: "workspace", name: "작업 폴더 안에서", selected: true },
+    { id: "machine", name: "이 컴퓨터 · 자격 증명 폴더 제외" },
+  ],
+  ramPolicy: [
+    { id: "defer", name: "여유 메모리가 생길 때까지 대기", selected: true },
+    { id: "skip", name: "이번 실행 건너뛰기" },
+    { id: "downgrade", name: "더 작은 모델로 실행" },
   ],
   preset: [
     { id: "save", name: "저장만", selected: true },
@@ -172,7 +178,7 @@ function runStatus(run) {
 
 function statusClass(status) {
   if (status === "ok") return "ok";
-  if (status === "fail" || status === "deferred_timeout") return "bad";
+  if (status === "fail" || status === "deferred_timeout" || status === "empty") return "bad";
   return "muted";
 }
 
@@ -208,6 +214,7 @@ function mountFormDrops() {
   DD.mount("permissionDrop", { label: "권한", items: FORM.permission });
   DD.mount("presetDrop", { label: "언제", items: FORM.preset, onChange: syncWhen });
   DD.mount("alertDrop", { label: "알림", items: FORM.alert });
+  DD.mount("ramPolicyDrop", { label: "메모리가 부족할 때", items: FORM.ramPolicy, onChange: syncPolicy });
   const range = document.getElementById("effortRange");
   if (range) {
     range.addEventListener("input", () => {
@@ -217,6 +224,20 @@ function mountFormDrops() {
     });
     setEffortLabel(Number(range.value));
   }
+}
+
+function syncPolicy(policy) {
+  document.getElementById("deferWrap").hidden = policy !== "defer";
+  document.getElementById("fallbackWrap").hidden = policy !== "downgrade";
+}
+
+function mountFallbackDrop(pick) {
+  const items = [{ id: "", name: "설치된 모델 중 자동 선택", selected: !pick }];
+  items.push(...installedModels.map((name) => ({ id: name, name, selected: name === pick })));
+  if (pick && !installedModels.includes(pick)) {
+    items.push({ id: pick, name: pick, line: "설치되지 않은 대체 모델", selected: true, disabled: true });
+  }
+  DD.mount("fallbackModelDrop", { label: "대체 모델", items });
 }
 
 function syncWhen(id) {
@@ -237,7 +258,7 @@ function setEffortLabel(n) {
 
 function effortValue() {
   const range = document.getElementById("effortRange");
-  return EFFORTS[Number(range && range.value) || 1] || "medium";
+  return EFFORTS[clampInt(range ? range.value : "1", 0, 2, 1)];
 }
 
 function setEffortValue(id) {
@@ -779,7 +800,7 @@ function paintTools(selected) {
     items: [
       { id: "cli", name: "CLI", line: "이 자동화에서 셸 명령을 실행", selected: on.has("cli") },
       { id: "http", name: "API", line: "이 자동화에서 HTTP를 호출", selected: on.has("http") },
-      { id: "chrome", name: "Chrome", line: "이 자동화에서 브라우저를 염", selected: on.has("chrome") },
+      { id: "chrome", name: "웹 페이지 읽기", line: "공개 웹 페이지의 내용을 가져옴", selected: on.has("chrome") },
     ],
   });
 }
@@ -1204,7 +1225,6 @@ function fillEdit(job) {
     mountModelDrop(job.model, missing);
     if (missing) showEditError(`저장된 모델 '${job.model}'이 지금은 설치되어 있지 않습니다. 설치에서 받거나 다른 모델을 고르세요.`);
   }
-  DD.setValue("jobProviderDrop", (job && job.provider) || "ollama");
   DD.setValue("jobAgentDrop", (job && job.agent) || "chat");
   if (job) setEffortValue(job.effort || "medium");
   else setEffortValue(effortForModel(DD.value("jobModelDrop")));
@@ -1235,7 +1255,7 @@ function formPayload(extra) {
   return {
     title: document.getElementById("title").value,
     prompt: document.getElementById("prompt").value,
-    provider: DD.value("jobProviderDrop") || "ollama",
+    provider: "ollama",
     model: DD.value("jobModelDrop"),
     agent: DD.value("jobAgentDrop") || "chat",
     tools: DD.selected("jobToolsDrop"),
@@ -1244,6 +1264,7 @@ function formPayload(extra) {
     time: document.getElementById("whenTime").value,
     alert: DD.value("alertDrop"),
     effort: effortValue(),
+    num_ctx: editNumCtx,
     permission: DD.value("permissionDrop"),
     cron: (document.getElementById("cronExpr") || {}).value || "",
     ram_policy: DD.value("ramPolicyDrop") || "defer",

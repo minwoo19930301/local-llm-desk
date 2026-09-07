@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import sys
+import os
+import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -34,6 +37,13 @@ class ParseTests(unittest.TestCase):
 
 
 class NextRunsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.zone = mock.patch.dict(os.environ, {"TZ": "Asia/Seoul"})
+        self.zone.start()
+        time.tzset()
+        self.addCleanup(time.tzset)
+        self.addCleanup(self.zone.stop)
+
     def test_weekday_morning(self) -> None:
         runs = cronwhen.next_runs("30 9 * * 1-5", FRIDAY_EVENING, 3)
         self.assertEqual([r.isoformat() for r in runs], ["2026-09-07T09:30:00+09:00", "2026-09-08T09:30:00+09:00", "2026-09-09T09:30:00+09:00"])
@@ -55,7 +65,21 @@ class NextRunsTests(unittest.TestCase):
     def test_horizon_and_naive_start(self) -> None:
         runs = cronwhen.next_runs("0 * * * *", datetime(2026, 9, 4, 20, 30), horizon=datetime(2026, 9, 4, 22, 0, tzinfo=SEOUL))
         self.assertEqual([r.hour for r in runs], [21, 22])
-        self.assertEqual(runs[0].tzinfo, SEOUL)
+        self.assertEqual(runs[0].utcoffset(), FRIDAY_EVENING.utcoffset())
+
+    def test_system_timezone_controls_cron_even_for_aware_start(self) -> None:
+        with mock.patch.dict(os.environ, {"TZ": "UTC"}):
+            time.tzset()
+            start = datetime(2026, 9, 8, 17, 0, tzinfo=SEOUL)  # 08:00 UTC
+            self.assertEqual(cronwhen.next_runs("0 9 * * *", start, 1), [datetime(2026, 9, 8, 9, 0, tzinfo=timezone.utc)])
+        time.tzset()
+
+    def test_future_dates_use_their_own_dst_offset(self) -> None:
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+            time.tzset()
+            runs = cronwhen.next_runs("0 9 * * *", datetime(2026, 3, 7, 8, 0), 2)
+            self.assertEqual([r.isoformat() for r in runs], ["2026-03-07T09:00:00-05:00", "2026-03-08T09:00:00-04:00"])
+        time.tzset()
 
     def test_impossible_date_returns_empty(self) -> None:
         self.assertEqual(cronwhen.next_runs("0 0 30 2 *", FRIDAY_EVENING), [])

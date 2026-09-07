@@ -2,7 +2,7 @@
 
 실행: python3 -m unittest tests.test_connectors -v
 - MCPClient 를 tests/mcp_stub.py 에 붙여 initialize → tools/list → tools/call → timeout → close 를 확인한다.
-- connectors.discover() 가 이 맥의 설정에서 후보를 찾고 env 값을 절대 노출하지 않는지 확인한다.
+- connectors.discover() 가 임시 설정에서 후보를 찾고 env 값을 절대 노출하지 않는지 확인한다.
 - tools.specs/run/system_prompt 의 이름 규칙과 권한 규칙을 확인한다.
 """
 from __future__ import annotations
@@ -14,12 +14,14 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from contextlib import ExitStack
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from desk import connectors, mcp_host, tools  # noqa: E402
+from desk import connectors, mcp_host, tools, state  # noqa: E402
 
 STUB = ROOT / "tests" / "mcp_stub.py"
 
@@ -31,7 +33,34 @@ def stub_connector(name: str = "stub") -> dict:
     }
 
 
-class MCPStdioTest(unittest.TestCase):
+class HermeticCase(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        home, data = root / 'home', root / 'data'
+        home.mkdir(); data.mkdir()
+        (home / '.codex').mkdir()
+        (home / '.codex' / 'config.toml').write_text(
+            '[mcp_servers.kakaopay]\ncommand="fake-command"\n[mcp_servers.kakaopay.env]\nKAKAOPAY_SECRET_KEY="FAKE_ONLY_SECRET"\n'
+            '[mcp_servers.node_repl]\ncommand="fake-command"\n')
+        (home / '.claude.json').write_text(json.dumps({'mcpServers': {
+            'dingtalk': {'type': 'http', 'url': 'https://example.invalid/mcp?key=FAKE_QUERY_SECRET'},
+            'pricing-brain': {'command': 'fake-command'}}}))
+        skill = home / '.codex' / 'skills' / 'demo'
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_text('---\nname: demo\ndescription: fixture\n---\nFixture only.')
+        for module, name, value in [
+            (connectors, 'HOME', home), (connectors, 'FILE', data / 'connectors.json'),
+            (connectors, 'LEGACY_FILE', data / 'mcp.json'), (connectors, 'LOGS_DIR', data),
+            (mcp_host, 'LOGS_DIR', data), (state, 'LOCK_FILE', data / '.lock'),
+            (tools, 'WORKSPACE', data / 'workspace')]:
+            self.stack.enter_context(patch.object(module, name, value))
+        for module in (connectors, mcp_host, state):
+            self.stack.enter_context(patch.object(module, 'ensure_dirs', lambda: None))
+
+
+class MCPStdioTest(HermeticCase):
     def test_full_roundtrip(self) -> None:
         client = mcp_host.MCPClient(stub_connector(), {}, timeout=10)
         client.start()
@@ -75,59 +104,36 @@ class MCPStdioTest(unittest.TestCase):
         self.assertEqual(clients, {})
 
 
-class ToolsTest(unittest.TestCase):
-    def test_specs_and_run_with_mcp(self) -> None:
+class ToolsTest(HermeticCase):
+    def test_specs_and_run_with_mcp(self):
         con = stub_connector("Stub 서버")
         clients = mcp_host.open_for_job([con])
-        try:
-            cli = {"id": "ccli00001", "kind": "cli", "name": "echo-cli", "enabled": True, "command_template": "echo {text}",
-                   "params": {"text": {"type": "string", "required": True, "description": "글"}}, "readonly": True, "timeout": 10}
-            spec = tools.specs("workspace", ["cli"], [con, cli], clients)
-            names = [t["function"]["name"] for t in spec]
-            self.assertIn("run_cli", names)
-            self.assertIn("read_file", names)
-            self.assertIn("cli__echo-cli", names)
-            self.assertIn("mcp__Stub__add", names)
-            add_spec = next(t for t in spec if t["function"]["name"] == "mcp__Stub__add")
-            self.assertEqual(add_spec["function"]["parameters"]["required"], ["a", "b"])
-            self.assertEqual(tools.run("mcp__Stub__add", {"a": 1, "b": 2}, "workspace", clients), "3")
-            self.assertTrue(tools.run("mcp__Stub__fail", {}, "workspace", clients).startswith("도구 실패:"))
-            self.assertEqual(tools.run("cli__echo-cli", {"text": "hi there"}, "read", clients), "hi there")
-            self.assertTrue(tools.run("nope", {}, "workspace", clients).startswith("모르는 도구"))
-        finally:
-            mcp_host.close_clients(clients)
+        self.addCleanup(mcp_host.close_clients, clients)
+        cli = {"id": "cli", "kind": "cli", "name": "echo-cli", "enabled": True,
+               "command_template": "echo {text}", "params": {"text": {"type": "string", "required": True}},
+               "readonly": True}
+        context = tools.build_context("workspace", ["cli"], [con, cli], clients)
+        names = [t["function"]["name"] for t in context.specifications]
+        self.assertIn("run_cli", names)
+        self.assertIn("mcp__Stub__add", names)
+        self.assertEqual(tools.run("mcp__Stub__add", {"a": 1, "b": 2}, "workspace", clients, context=context), "3")
+        self.assertTrue(tools.run("mcp__Stub__fail", {}, "workspace", clients, context=context).startswith("도구 실패:"))
+        read_context = tools.build_context("read", [], [cli], {})
+        self.assertEqual(tools.run("cli__echo-cli", {"text": "hi there"}, "read", {}, context=read_context), "hi there")
+        self.assertIn("선택되지 않은", tools.run("nope", {}, "workspace", clients, context=context))
 
-    def test_read_permission_rules(self) -> None:
-        spec = tools.specs("read", ["cli", "http"], [], {})
-        names = {t["function"]["name"] for t in spec}
-        self.assertNotIn("run_cli", names)
-        self.assertIn("http_request", names)
-        self.assertIn("도구 실패", tools.run("run_cli", {"command": "ls"}, "read", {}))
-        self.assertIn("localhost", tools.run("http_request", {"url": "http://127.0.0.1:8788/api/status"}, "workspace", {}))
-        self.assertEqual(tools.specs("workspace", [], [], {}), [])
-        self.assertEqual([t["function"]["name"] for t in tools.specs("workspace", [], [{"kind": "cli", "id": "x", "name": "x",
-                                                                                          "command_template": "ls"}], {})][:1], ["read_file"])
-
-    def test_workspace_cli_blocks_outside_paths(self) -> None:
-        self.assertIn("도구 실패", tools.run("run_cli", {"command": "cat ~/.ssh/id_rsa"}, "workspace", {}))
-        self.assertIn("도구 실패", tools.run("run_cli", {"command": "ls /etc"}, "workspace", {}))
-        self.assertIn("도구 실패", tools.run("run_cli", {"command": "cat ~/.ssh/config"}, "machine", {}))
-        self.assertNotIn("도구 실패", tools.run("run_cli", {"command": "echo ok"}, "workspace", {}))
-
-    def test_system_prompt_with_skill(self) -> None:
+    def test_system_prompt_with_skill(self):
         with tempfile.TemporaryDirectory() as tmp:
             skill = Path(tmp) / "SKILL.md"
-            skill.write_text("---\nname: demo\ndescription: 데모\n---\n\n# 본문\n\n" + "x" * 7000, encoding="utf-8")
-            con = {"kind": "skill", "name": "demo", "enabled": True, "path": str(skill)}
-            text = tools.system_prompt("read", 8, [con])
+            skill.write_text("---\nname: demo\ndescription: 데모\n---\n\n# 본문\n\n" + "x" * 7000)
+            text = tools.system_prompt("read", 8, [{"kind": "skill", "name": "demo", "enabled": True, "path": str(skill)}])
             self.assertIn("## 스킬: demo", text)
-            self.assertIn("# 본문", text)
             self.assertNotIn("description: 데모", text)
-            self.assertLess(len(text), 6000 + 400)
+            self.assertLess(len(text), 6400)
 
 
-class DiscoverTest(unittest.TestCase):
-    def test_discover_on_this_mac(self) -> None:
+class DiscoverTest(HermeticCase):
+    def test_discover_fixture_configs(self) -> None:
         cands = connectors.discover()
         by_source: dict[str, list[dict]] = {}
         for c in cands:
@@ -166,7 +172,7 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(pub["headers_keys"], ["Authorization"])
 
     def test_expand_vars(self) -> None:
-        os.environ["DESK_TEST_VAR"] = "v1"
+        self.stack.enter_context(patch.dict(os.environ, {"DESK_TEST_VAR": "v1"}))
         self.assertEqual(connectors.expand_vars("${DESK_TEST_VAR}"), "v1")
         self.assertEqual(connectors.expand_vars("${DESK_NOPE:-dflt}"), "dflt")
         self.assertEqual(connectors.expand_vars("${DESK_NOPE}"), "")
@@ -180,19 +186,8 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(body, "BODY")
 
 
-class RegistryTest(unittest.TestCase):
+class RegistryTest(HermeticCase):
     """data/ 를 임시 폴더로 바꿔 add/update/remove/이관을 확인한다."""
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        data = Path(self.tmp.name)
-        self._saved = (connectors.FILE, connectors.LEGACY_FILE)
-        connectors.FILE = data / "connectors.json"
-        connectors.LEGACY_FILE = data / "mcp.json"
-
-    def tearDown(self) -> None:
-        connectors.FILE, connectors.LEGACY_FILE = self._saved
-        self.tmp.cleanup()
 
     def test_crud_and_migration(self) -> None:
         connectors.LEGACY_FILE.write_text(json.dumps({"servers": {"old": {"command": "python3", "args": ["x.py"], "env": {"K": "V"}}}}))

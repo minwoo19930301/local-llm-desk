@@ -159,30 +159,36 @@ class Handler(BaseHTTPRequestHandler):
     def _sse(self, factory: Callable[[dict[str, Any]], Any], body: dict[str, Any]) -> None:
         if not _install_lock.acquire(blocking=False):
             return self._json(409, {"error": "이미 진행 중"})
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        self.wfile.write(b": connected\n\n")
-        self.wfile.flush()
+        events = None
         try:
-            for ev in factory(body):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            events = iter(factory(body))
+            for ev in events:
                 if installer.cancelled() and ev.get("event") != "done":
                     ev = {"event": "done", "ok": False, "cancelled": True, "error": "취소했습니다."}
                 self._event(ev)
                 if ev.get("event") == "done":
                     break
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             installer.request_cancel()
         except Exception as exc:
             try:
                 self._event({"event": "done", "ok": False, "error": str(exc), "trace": traceback.format_exc()})
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 installer.request_cancel()
         finally:
-            _install_lock.release()
+            try:
+                if events is not None and hasattr(events, "close"):
+                    events.close()
+            finally:
+                _install_lock.release()
 
     def _event(self, ev: dict[str, Any]) -> None:
         self.wfile.write(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8"))
@@ -336,9 +342,9 @@ def _status_route(req: Request) -> Result:
 
 def _status() -> dict[str, Any]:
     cfg = load_config()
-    up = ollama_ctl.running()
-    live = ollama_ctl.list_models() if up else []
-    if live:
+    live = ollama_ctl.model_inventory()
+    up = live is not None
+    if live is not None:
         names = [n for n in ((m.get("name") or m.get("model") or "") for m in live) if n]
         if sorted(names) != sorted(ollama_ctl.remembered_models()):
             ollama_ctl.remember_models(names)
