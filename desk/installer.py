@@ -42,97 +42,168 @@ def allowed_models() -> set[str]:
 def setup(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     _cancel.clear()
     ensure_dirs()
-    providers = list(body.get("providers") or [])
-    models = [n for n in (body.get("models") or []) if n in allowed_models()]
-    agents = list(body.get("agents") or [])
-    need_ollama = "ollama" in providers or bool(models)
-    if not need_ollama and not agents and not providers:
-        yield _log("고를 항목이 없습니다.")
-        yield {"event": "done", "ok": False, "ready": False}
-        return
+    stage = str(body.get("stage") or "providers")
     try:
-        if need_ollama:
-            _check()
-            yield _log("Ollama", progress=4, stage="Ollama")
-            for ev in _ensure_ollama():
-                _check()
-                yield ev
-                if ev.get("event") == "error":
-                    yield {"event": "done", "ok": False, "ready": False}
-                    return
-            try:
-                ollama_ctl.ensure_background()
-            except Exception:
-                pass
-            yield _log("Ollama 백그라운드", progress=18, stage="Ollama")
-        if "llamacpp" in providers:
-            yield _log("llama.cpp", progress=20, stage="llama.cpp")
-            for ev in _install_llamacpp():
-                yield ev
-                if ev.get("event") == "error":
-                    yield {"event": "done", "ok": False, "ready": False}
-                    return
-        if "mlx" in providers:
-            yield _log("MLX", progress=22, stage="MLX")
-            for ev in _install_mlx():
-                yield ev
-                if ev.get("event") == "error":
-                    yield {"event": "done", "ok": False, "ready": False}
-                    return
-        n = max(1, len(models))
-        for i, name in enumerate(models):
-            base = 24 + int(70 * i / n)
-            if ollama_ctl.has_model(name):
-                yield _log(f"{name} 있음", progress=24 + int(70 * (i + 1) / n), stage=name)
-                continue
-            yield _log(f"{name} 받는 중", progress=base, stage=name)
-            for line in ollama_ctl.pull_model(name):
-                pct = _pct(line)
-                mapped = base + int((70 / n) * (pct / 100)) if pct is not None else None
-                ev = _from_pipe(line, name, mapped)
-                if ev:
-                    yield ev
-            yield _log(f"{name} 완료", progress=24 + int(70 * (i + 1) / n), stage=name)
-        for agent in agents:
-            if agent == "desk":
-                yield _log("잡 러너 있음")
-                continue
-            if agent == "open-webui":
-                for ev in _install_open_webui():
-                    yield ev
-                    if ev.get("event") == "error":
-                        yield {"event": "done", "ok": False}
-                        return
-            elif agent == "aider":
-                for ev in _install_aider():
-                    yield ev
-                    if ev.get("event") == "error":
-                        yield {"event": "done", "ok": False}
-                        return
-            elif agent == "opencode":
-                for ev in _install_opencode():
-                    yield ev
-                    if ev.get("event") == "error":
-                        yield {"event": "done", "ok": False}
-                        return
-            else:
-                yield _log(f"이 화면에서 설치 불가: {agent}")
-        have_models = bool(ollama_ctl.list_models())
-        cfg = load_config()
-        cfg["setup_done"] = have_models
-        save_config(cfg)
-        yield _log("완료", progress=100)
-        yield {"event": "done", "ok": True, "ready": have_models}
+        if stage == "models":
+            yield from _setup_models(body)
+            return
+        yield from _setup_providers(body)
     except Exception as exc:
+        _cleanup_tmp()
         msg = str(exc)
         if cancelled() or "취소" in msg:
             yield {"event": "done", "ok": False, "cancelled": True, "error": "취소했습니다."}
             return
-        yield _log(msg)
         yield {"event": "done", "ok": False, "ready": False, "error": msg}
 
 
+def _provider_ready() -> bool:
+    if ollama_ctl.running():
+        return True
+    if not (ollama_ctl.app_installed() or ollama_ctl.binary()):
+        return False
+    try:
+        ollama_ctl.start()
+    except Exception:
+        return False
+    return ollama_ctl.wait_until_up(20)
+
+
+def _setup_providers(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    providers = list(body.get("providers") or ["ollama"])
+    if not providers:
+        yield {"event": "done", "ok": False, "error": "프로바이더를 고르세요."}
+        return
+    warnings: list[str] = []
+    if "ollama" in providers:
+        _check()
+        yield _log("Ollama", progress=4, stage="Ollama")
+        for ev in _ensure_ollama():
+            _check()
+            yield ev
+            if ev.get("event") == "error":
+                _cleanup_tmp()
+                yield {"event": "done", "ok": False, "error": ev.get("line") or "Ollama 설치 실패"}
+                return
+        try:
+            ollama_ctl.ensure_background()
+        except Exception:
+            pass
+        if not _provider_ready():
+            yield {"event": "done", "ok": False, "error": "Ollama는 받았지만 서버가 안 켜졌습니다. 다시 시도하세요."}
+            return
+        yield _log("Ollama 준비됨", progress=50, stage="Ollama")
+    if "llamacpp" in providers:
+        _check()
+        yield _log("llama.cpp", progress=60, stage="llama.cpp")
+        failed = False
+        for ev in _install_llamacpp():
+            yield ev
+            if ev.get("event") == "error":
+                warnings.append(ev.get("line") or "llama.cpp 실패")
+                failed = True
+                break
+        if not failed:
+            yield _log("llama.cpp 완료", progress=80, stage="llama.cpp")
+    if "mlx" in providers:
+        _check()
+        yield _log("MLX", progress=85, stage="MLX")
+        failed = False
+        for ev in _install_mlx():
+            yield ev
+            if ev.get("event") == "error":
+                warnings.append(ev.get("line") or "MLX 실패")
+                failed = True
+                break
+        if not failed:
+            yield _log("MLX 완료", progress=95, stage="MLX")
+    ready = _provider_ready() if "ollama" in providers else True
+    if "ollama" in providers and not ready:
+        yield {"event": "done", "ok": False, "error": "Ollama 서버가 꺼져 있습니다. 다시 시도하세요."}
+        return
+    yield _log("완료", progress=100, stage="Ollama")
+    yield {
+        "event": "done",
+        "ok": True,
+        "provider_ready": ready,
+        "ready": False,
+        "warning": " · ".join(warnings),
+    }
+
+
+def _setup_models(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    if not _provider_ready():
+        yield {"event": "done", "ok": False, "error": "먼저 프로바이더를 받으세요."}
+        return
+    allowed = allowed_models()
+    models = [n for n in (body.get("models") or []) if n in allowed]
+    agents = list(body.get("agents") or [])
+    if not models and not agents:
+        yield {"event": "done", "ok": False, "error": "모델을 하나 고르세요."}
+        return
+    n = max(1, len(models))
+    for i, name in enumerate(models):
+        _check()
+        base = int(90 * i / n)
+        if ollama_ctl.has_model(name):
+            yield _log(f"{name} 있음", progress=int(90 * (i + 1) / n), stage=name)
+            continue
+        yield _log(f"{name} 받는 중", progress=base, stage=name)
+        for line in ollama_ctl.pull_model(name):
+            _check()
+            pct = _pct(line)
+            mapped = base + int((90 / n) * (pct / 100)) if pct is not None else None
+            ev = _from_pipe(line, name, mapped)
+            if ev:
+                yield ev
+        yield _log(f"{name} 완료", progress=int(90 * (i + 1) / n), stage=name)
+    for agent in agents:
+        _check()
+        if agent == "desk":
+            continue
+        if agent == "open-webui":
+            for ev in _install_open_webui():
+                yield ev
+                if ev.get("event") == "error":
+                    yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
+                    return
+        elif agent == "aider":
+            for ev in _install_aider():
+                yield ev
+                if ev.get("event") == "error":
+                    yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
+                    return
+        elif agent == "opencode":
+            for ev in _install_opencode():
+                yield ev
+                if ev.get("event") == "error":
+                    yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
+                    return
+        else:
+            yield _log(f"이 화면에서 설치 불가: {agent}")
+    have_models = bool(ollama_ctl.list_models())
+    if have_models:
+        ollama_ctl.remember_models()
+    cfg = load_config()
+    cfg["setup_done"] = have_models
+    save_config(cfg)
+    ollama_ctl.stop()
+    yield _log("완료", progress=100)
+    yield {"event": "done", "ok": True, "ready": have_models}
+
+
+def _cleanup_tmp() -> None:
+    for path in ("/tmp/Ollama.dmg",):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+    subprocess.run(["hdiutil", "detach", "/tmp/ollama-mnt", "-quiet", "-force"], capture_output=True)
+
+
 def remove(names: list[str]) -> Iterator[dict[str, Any]]:
+    _cancel.clear()  # 이전 설치 취소 플래그가 삭제 스트림을 끊지 않게
     ensure_dirs()
     names = [n for n in names if n]
     if not names:
@@ -279,22 +350,31 @@ def _ensure_ollama() -> Iterator[dict[str, Any]]:
 
 
 def _download_file(url: str, dest: str, stage: str) -> Iterator[dict[str, Any]]:
+    import urllib.error
     import urllib.request
 
     yield _log(f"{stage} 받는 중", progress=1, stage=stage)
-    req = urllib.request.Request(url, headers={"User-Agent": "local-llm-desk"})
-    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
-        total = int(resp.headers.get("Content-Length") or 0)
-        got = 0
-        while True:
-            _check()
-            chunk = resp.read(256 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
-            got += len(chunk)
-            if total:
-                yield {"event": "log", "progress": max(1, min(99, int(got * 100 / total))), "stage": stage}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Free-AI-Scheduler"})
+        with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got = 0
+            while True:
+                _check()
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                got += len(chunk)
+                if total:
+                    yield {"event": "log", "progress": max(1, min(99, int(got * 100 / total))), "stage": stage}
+    except Exception:
+        try:
+            if os.path.isfile(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        raise
 
 
 def _install_ollama_app() -> Iterator[dict[str, Any]]:

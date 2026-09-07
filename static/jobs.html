@@ -3,45 +3,162 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>자동화</title>
+  <title>Free AI Scheduler</title>
   <link rel="stylesheet" href="/static/layout.css" />
 </head>
 <body>
-  <header class="bar">
-    <p class="bar__name">로컬 LLM</p>
-  </header>
+  <div class="banner" id="offline" role="alert" hidden>서버가 꺼져 있습니다 (재시도 중)</div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <main class="page">
+    <nav class="tabs" id="tabs" aria-label="주요 화면" hidden>
+      <button type="button" class="tabs__tab" data-path="/jobs">자동화</button>
+      <button type="button" class="tabs__tab" data-path="/connectors">연동</button>
+      <button type="button" class="tabs__tab" data-path="/settings">설정</button>
+      <button type="button" class="tabs__tab" data-path="/install">설치</button>
+    </nav>
 
-  <main class="page" id="appMain" hidden>
-    <div class="gds-heading">
-      <p class="gds-heading__title">자동화</p>
-      <span class="gds-heading__side-action">
-        <button type="button" class="gds-button gds-button--small" id="addBtn">추가</button>
-        <button type="button" class="gds-button gds-button--secondary gds-button--small" id="openInstall">설치</button>
-      </span>
-    </div>
-    <div id="jobList" class="jobs"></div>
-  </main>
+    <section id="viewWelcome" hidden>
+      <div class="splash is-logo" id="splash">
+        <video id="introVideo" src="/static/media/intro.mp4" poster="/static/media/intro.jpg" muted playsinline preload="auto"></video>
+        <div class="splash__veil"></div>
+        <div class="splash__stage" id="splashStage">
+          <div class="splash__logo" id="splashLogo">
+            <p class="splash__kicker">Free AI</p>
+            <p class="splash__word" aria-label="Scheduler">
+              <span>S</span><span>c</span><span>h</span><span>e</span><span>d</span><span>u</span><span>l</span><span>e</span><span>r</span>
+            </p>
+          </div>
+          <p class="splash__lead" id="splashLead">AI 비용 없이도<br />당신 컴퓨터를 AI로 만들어<br />자동화를 할 수 있게 됩니다.</p>
+        </div>
+        <div class="splash__seek" id="splashSeek" hidden>
+          <div class="seek__nav">
+            <button type="button" class="gds-button gds-button--secondary gds-button--small" id="seekBack">이전</button>
+            <button type="button" class="gds-button gds-button--cta gds-button--small" id="splashNext">다음</button>
+          </div>
+          <svg class="seek__svg" viewBox="0 0 240 150" aria-hidden="true">
+            <rect x="44" y="18" width="152" height="96" rx="8" fill="none" stroke="currentColor" stroke-width="2" />
+            <rect x="52" y="26" width="136" height="80" rx="3" fill="#eee" />
+            <rect class="seek__line" x="52" y="26" width="136" height="3" />
+            <rect x="28" y="116" width="184" height="10" rx="3" fill="none" stroke="currentColor" stroke-width="2" />
+            <g class="seek__glass">
+              <circle cx="0" cy="0" r="16" fill="rgba(255,255,255,.55)" stroke="currentColor" stroke-width="2.2" />
+              <path d="M12 12 L24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+            </g>
+          </svg>
+          <p class="seek__label" id="splashCheckText">스펙을 찾는 중</p>
+          <p class="seek__dots" aria-hidden="true"><i></i><i></i><i></i></p>
+          <dl class="splash__specs" id="splashSpecs" hidden></dl>
+          <div class="guide__copy" id="guideCopy" hidden></div>
+          <ul class="seek__list" id="seekList" hidden></ul>
+          <div class="seek__pick" id="seekPick" hidden>
+            <div class="field-row">
+              <div id="seekModelDrop"></div>
+              <button type="button" class="gds-button gds-button--cta" id="seekModelBtn">다운로드</button>
+            </div>
+            <p class="legend" id="seekModelHint"></p>
+          </div>
+        </div>
+      </div>
+    </section>
 
-  <div class="modal" id="editModal" hidden>
-    <div class="sheet">
+    <section id="viewProvider" hidden>
+      <div class="step-nav">
+        <button type="button" class="gds-button gds-button--secondary gds-button--small" id="providerBackBtn">이전</button>
+        <button type="button" class="gds-button gds-button--cta gds-button--small" id="providerNextBtn">다음</button>
+      </div>
+      <p class="step-title">프로바이더</p>
+      <p class="legend">프로바이더는 AI를 돌리는 엔진입니다. 모델은 그 엔진이 실제로 쓰는 뇌입니다.</p>
+      <div class="field-row">
+        <div id="providerDrop"></div>
+        <button class="gds-button gds-button--cta" id="installBtn" type="button">다운로드</button>
+      </div>
+      <p class="legend" id="hint"></p>
+    </section>
+
+    <section id="viewModels" hidden>
+      <div class="step-nav">
+        <button type="button" class="gds-button gds-button--secondary gds-button--small" id="backBtn">이전</button>
+        <button type="button" class="gds-button gds-button--cta gds-button--small" id="modelsNextBtn">다음</button>
+      </div>
+      <p class="step-title">모델</p>
+      <p class="legend">모델은 프로바이더가 실제로 쓰는 뇌입니다. 같은 엔진 위에 여러 개를 올릴 수 있습니다.</p>
+      <ul class="seek__list" id="haveModels" hidden></ul>
+      <div class="field-row">
+        <div id="modelDrop"></div>
+        <button class="gds-button gds-button--cta" id="modelBtn" type="button">다운로드</button>
+      </div>
+      <p class="legend" id="modelHint"></p>
+    </section>
+
+    <section id="viewProgress" hidden>
+      <div class="progress" id="progress">
+        <div class="spin" id="progressSpin" aria-hidden="true"></div>
+        <p class="progress__title" id="progressTitle">받는 중</p>
+        <p class="progress__what" id="progressWhat"></p>
+        <div class="progress__bar"><i id="progressBar"></i></div>
+        <p class="progress__pct" id="progressPct">0%</p>
+        <p class="progress__err" id="progressErr" hidden></p>
+        <button type="button" class="gds-button gds-button--secondary" id="cancelBtn">취소</button>
+        <div class="row" id="failActions" hidden>
+          <button type="button" class="gds-button gds-button--cta" id="retryBtn">다시 시도</button>
+          <button type="button" class="gds-button gds-button--secondary" id="failBackBtn">선택으로</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="viewJobs" hidden>
+      <div class="gds-heading">
+        <p class="gds-heading__title">자동화</p>
+        <span class="gds-heading__side-action">
+          <div class="seg" role="group" aria-label="보기 방식">
+            <button type="button" class="seg__btn" id="viewListBtn" aria-pressed="true">목록</button>
+            <button type="button" class="seg__btn" id="viewTimelineBtn" aria-pressed="false">타임라인</button>
+          </div>
+          <button type="button" class="gds-button gds-button--small" id="addBtn">추가</button>
+        </span>
+      </div>
+      <p class="ram-line" id="ramLine"></p>
+      <p class="active-line" id="activeLine" hidden></p>
+      <div id="jobList" class="jobs"></div>
+      <div id="timelineWrap" class="timeline" hidden>
+        <div class="chips" id="tlRange" role="group" aria-label="범위"></div>
+        <div class="timeline__host" id="timelineHost"></div>
+        <div class="tl-tip" id="tlTip" role="tooltip" hidden></div>
+      </div>
+    </section>
+
+    <section id="viewEdit" hidden>
       <div class="gds-heading">
         <p class="gds-heading__title" id="editTitle">추가</p>
-        <button type="button" class="gds-button gds-button--secondary gds-button--small" data-close="editModal">닫기</button>
+        <button type="button" class="gds-button gds-button--secondary gds-button--small" id="editBackBtn">목록</button>
       </div>
       <div class="stack">
         <div class="gds-text-field gds-text-field--small">
-          <input id="title" class="gds-text-field__input" placeholder="제목 (없어도 됨)" />
+          <input id="title" class="gds-text-field__input" placeholder="제목 (없어도 됨)" aria-label="제목" />
         </div>
-        <div id="modelDrop"></div>
-        <textarea id="prompt" class="note" placeholder="예: 오늘 할 일을 세 줄로 요약해 줘."></textarea>
-        <div id="effortDrop"></div>
+        <div id="jobModelDrop"></div>
+        <p class="ram-line ram-line--form" id="editRam"></p>
+        <div id="jobAgentDrop"></div>
+        <div id="jobToolsDrop"></div>
+        <div id="connectorsDrop"></div>
+        <p class="legend legend--left"><a class="link" href="/connectors" id="manageConnectors">연동 관리 →</a></p>
+        <textarea id="prompt" class="note" placeholder="예: 오늘 할 일을 세 줄로 요약해 줘." aria-label="시킬 일"></textarea>
+        <div class="effort">
+          <p class="effort__label">추론 수준 <span id="effortLabel">균형</span></p>
+          <input id="effortRange" class="effort__range" type="range" min="0" max="2" step="1" value="1" aria-label="추론 수준" />
+          <div class="effort__ends">
+            <span>빠르고 간단</span>
+            <span>고급 · 느림</span>
+          </div>
+        </div>
         <div id="permissionDrop"></div>
-        <div id="loopsDrop"></div>
         <div id="presetDrop"></div>
         <div class="when" id="whenWrap" hidden>
-          <div id="repeatDrop"></div>
-          <div class="gds-text-field gds-text-field--small">
-            <input id="whenTime" class="gds-text-field__input" type="time" value="17:00" />
+          <div class="gds-text-field gds-text-field--small" id="timeWrap">
+            <input id="whenTime" class="gds-text-field__input" type="time" value="17:00" aria-label="시각" />
+          </div>
+          <div class="gds-text-field gds-text-field--small" id="cronWrap" hidden>
+            <input id="cronExpr" class="gds-text-field__input" placeholder="*/10 * * * *" aria-label="cron 식" />
           </div>
         </div>
         <div id="alertDrop"></div>
@@ -49,45 +166,65 @@
           <button class="gds-button gds-button--cta" id="tryBtn" type="button">지금 실행해보기</button>
           <button class="gds-button gds-button--secondary" id="saveBtn" type="button">저장</button>
         </div>
+        <p class="error" id="editError" hidden></p>
         <pre class="log" id="tryOut"></pre>
       </div>
-    </div>
-  </div>
+    </section>
 
-  <div class="modal" id="installModal" hidden>
-    <div class="sheet">
+    <section id="viewConnectors" hidden>
       <div class="gds-heading">
-        <p class="gds-heading__title">설치</p>
-        <button type="button" class="gds-button gds-button--secondary gds-button--small" id="installClose" data-close="installModal" hidden>닫기</button>
+        <p class="gds-heading__title">연동</p>
       </div>
-      <p class="legend" id="hwLine"></p>
-      <div class="gds-heading"><p class="gds-heading__title">받을 항목</p></div>
-      <p class="legend">예약은 Ollama가 백그라운드에서 합니다. llama.cpp는 필수가 아닙니다. 숫자는 그 모델의 디스크·램입니다.</p>
-      <div class="stack">
-        <div id="providerDrop"></div>
-        <div id="lightDrop"></div>
-        <div id="reasonDrop"></div>
-        <div id="agentDrop"></div>
+      <p class="legend legend--left">MCP 서버 · CLI 명령 · HTTP API · 스킬을 등록해 두고, 각 자동화에서 필요한 것만 골라 붙입니다.</p>
+      <h2 class="sec-title">등록된 연동</h2>
+      <div class="connector-list" id="conList"></div>
+      <h2 class="sec-title">이 맥에서 찾은 연동</h2>
+      <div class="connector-list" id="conDiscovered"></div>
+      <h2 class="sec-title">직접 추가</h2>
+      <div class="stack" id="conForm">
+        <div id="conKindDrop"></div>
+        <div class="stack" id="conFields"></div>
+        <p class="error" id="conError" hidden></p>
+        <div class="row">
+          <button type="button" class="gds-button gds-button--cta" id="conSaveBtn">추가</button>
+        </div>
       </div>
-      <p class="legend">글만 요약·답하는 일은 모델만 있으면 됩니다. MCP, CLI, 하네스, 반복 스킬을 입히려면 도구 에이전트가 필요합니다.</p>
-      <p class="legend" id="hint"></p>
-      <div class="row">
-        <button class="gds-button gds-button--cta" id="installBtn" type="button">받기</button>
+    </section>
+
+    <section id="viewSettings" hidden>
+      <div class="gds-heading">
+        <p class="gds-heading__title">설정</p>
       </div>
-      <div class="progress" id="progress" hidden>
-        <div class="spin" aria-hidden="true"></div>
-        <p class="progress__title" id="progressTitle">받는 중</p>
-        <p class="progress__what" id="progressWhat"></p>
-        <div class="progress__bar"><i id="progressBar"></i></div>
-        <p class="progress__pct" id="progressPct">0%</p>
-        <p class="progress__err" id="progressErr" hidden></p>
-        <button type="button" class="gds-button gds-button--secondary" id="cancelBtn">취소</button>
+      <div class="settings">
+        <h2 class="sec-title">알림</h2>
+        <label class="switch"><input type="checkbox" id="alertMacos" /> macOS 알림</label>
+        <label class="switch"><input type="checkbox" id="alertSound" /> 알림 소리</label>
+        <div class="gds-text-field gds-text-field--small">
+          <input id="alertWebhook" class="gds-text-field__input" placeholder="웹훅 URL (없어도 됨)" aria-label="웹훅 URL" />
+        </div>
+        <div class="row">
+          <button type="button" class="gds-button gds-button--cta gds-button--small" id="alertSaveBtn">저장</button>
+          <button type="button" class="gds-button gds-button--secondary gds-button--small" id="alertTestBtn">알림 테스트</button>
+        </div>
+        <p class="result" id="alertResult"></p>
+
+        <h2 class="sec-title">예약 상태</h2>
+        <p class="legend legend--left" id="cronSummary"></p>
+        <pre class="cron" id="cronInstalled"></pre>
+
+        <h2 class="sec-title">데이터 폴더</h2>
+        <p class="mono" id="dataDir"></p>
+
+        <h2 class="sec-title">소개</h2>
+        <p class="legend legend--left"><a class="link" href="/?intro=1" id="replayIntro">소개 다시 보기 →</a></p>
       </div>
-    </div>
-  </div>
+    </section>
+  </main>
 
   <script src="/static/dropdown.js"></script>
   <script src="/static/catalog.js"></script>
   <script src="/static/jobs.js"></script>
+  <script src="/static/timeline.js"></script>
+  <script src="/static/connectors.js"></script>
 </body>
 </html>
