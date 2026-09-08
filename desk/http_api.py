@@ -63,6 +63,7 @@ RUNS_LIMIT = (1, 500)
 DEFAULT_AVG_SECONDS = 90.0
 
 _install_lock = threading.Lock()
+_connector_draft_lock = threading.Lock()
 
 
 # ── routing ──────────────────────────────────────────────────────────────────
@@ -565,6 +566,32 @@ def conflicts(lanes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 # ── connectors ───────────────────────────────────────────────────────────────
+
+
+@route("GET", r"/api/connectors/options")
+def _connector_options(req: Request) -> Result:
+    from desk import connector_drafts
+    return 200, {"models": connector_drafts.available_models(),
+                 "provider_ready": bool(ollama_ctl.binary() or ollama_ctl.app_installed())}
+
+
+@route("POST", r"/api/connectors/draft")
+def _connector_draft(req: Request) -> Result:
+    from desk import connector_drafts
+    if not _connector_draft_lock.acquire(blocking=False):
+        return 409, {"error": "연동 초안을 만드는 중입니다. 완료 후 다시 요청하세요."}
+    try:
+        return 200, connector_drafts.draft(req.body)
+    finally:
+        _connector_draft_lock.release()
+
+
+@route("POST", r"/api/connectors/openapi")
+def _connector_openapi(req: Request) -> Result:
+    from desk import openapi_import
+    body = req.body
+    return 200, openapi_import.prepare(source_url=body.get("source_url"),
+                                      spec_text=body.get("spec_text"), operation_id=body.get("operation_id"))
 
 
 def redact(con: dict[str, Any]) -> dict[str, Any]:
