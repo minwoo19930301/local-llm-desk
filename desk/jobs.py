@@ -22,7 +22,9 @@ PRESETS = {
     "hourly": "0 * * * *",
     "every_6h": "0 */6 * * *",
     "once_1m": "once_1m",
+    "once_5m": "once_5m",
 }
+ONCE_DELAYS = {"once_1m": 1, "once_5m": 5}
 WHEN_PRESETS = ("daily", "weekdays", "weekend", "custom")
 TOOL_KINDS = ("cli", "http", "chrome", "mcp")
 
@@ -252,7 +254,7 @@ def _apply_patch(found: dict[str, Any], patch: dict[str, Any]) -> None:
 
 
 def _apply_schedule_patch(found: dict[str, Any], patch: dict[str, Any]) -> None:
-    """Re-resolve the schedule only when it really changed (never re-arm once_1m on unrelated edits)."""
+    """Re-resolve the schedule only when it really changed (never re-arm one-shot jobs on unrelated edits)."""
     preset = patch.get("preset", found.get("preset") or "custom")
     if not _schedule_changed(found, patch, preset):
         return
@@ -327,9 +329,24 @@ def mark_last_run(job_id: str, run: dict[str, Any]) -> None:
 
 
 def _schedule_fields(preset: str, body: dict[str, Any]) -> dict[str, Any]:
+    if preset in ONCE_DELAYS:
+        when = _once_when(preset)
+        return {"cron": _once_cron(when), "once": True, "once_at": when.isoformat(timespec="seconds")}
     cron, once = resolve_schedule(preset, body)
-    once_at = (_now() + timedelta(minutes=1)).isoformat(timespec="seconds") if once else None
-    return {"cron": cron, "once": once, "once_at": once_at}
+    return {"cron": cron, "once": once, "once_at": None}
+
+
+def _once_when(preset: str) -> datetime:
+    when = _now() + timedelta(minutes=ONCE_DELAYS[preset])
+    # cron runs on minute boundaries. The five-minute option must not fire early.
+    # Keep the original one-minute option's timing for existing clients.
+    if preset == "once_5m" and (when.second or when.microsecond):
+        when = (when + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    return when
+
+
+def _once_cron(when: datetime) -> str:
+    return f"{when.minute} {when.hour} {when.day} {when.month} *"
 
 
 def resolve_schedule(preset: str, payload: dict[str, Any] | str | None = None) -> tuple[str, bool]:
@@ -342,9 +359,8 @@ def resolve_schedule(preset: str, payload: dict[str, Any] | str | None = None) -
         cron = (payload or "").strip()
     if preset in ("save", "now"):
         return "", False
-    if preset == "once_1m":
-        when = _now() + timedelta(minutes=1)
-        return f"{when.minute} {when.hour} {when.day} {when.month} *", True
+    if preset in ONCE_DELAYS:
+        return _once_cron(_once_when(preset)), True
     if preset in WHEN_PRESETS:
         if preset == "custom" and cron:
             if not _valid_cron(cron):
@@ -403,7 +419,7 @@ def schedule_label(job: dict[str, Any]) -> str:
         if not job.get("enabled") or not cron:
             return "한 번 실행함"
         when = _parse_iso(job.get("once_at"))
-        return f"{when.month}/{when.day} {when:%H:%M} 한 번" if when else "1분 뒤 한 번"
+        return f"{when.month}/{when.day} {when:%H:%M} 한 번" if when else f"{ONCE_DELAYS.get(job.get('preset'), 1)}분 뒤 한 번"
     if not cron:
         return "예약 없음"
     try:

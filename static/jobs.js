@@ -24,6 +24,7 @@ const SCHEDULE = {
   weekdays: "평일",
   weekend: "주말",
   once_1m: "1분 뒤 한 번",
+  once_5m: "5분 뒤 한 번",
 };
 
 const STATUS_LABEL = {
@@ -73,6 +74,7 @@ const FORM = {
     { id: "weekdays", name: "평일" },
     { id: "weekend", name: "주말" },
     { id: "once_1m", name: "1분 뒤 한 번" },
+    { id: "once_5m", name: "5분 뒤 한 번" },
     { id: "cron", name: "cron 식" },
   ],
   alert: [
