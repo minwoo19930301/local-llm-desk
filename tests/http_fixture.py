@@ -26,6 +26,9 @@ def isolated_server():
         stack.enter_context(mock.patch.object(alerts, "_macos_window", return_value={"ok": True, "mode": "window", "opened": True, "submitted": True, "visible": None, "test_stub": True}))
         stack.enter_context(mock.patch.object(ollama_ctl, "running", return_value=False))
         stack.enter_context(mock.patch.object(ollama_ctl, "model_inventory", return_value=[{"name": "fixture-model:latest"}]))
+        stack.enter_context(mock.patch.object(ollama_ctl, "remembered_models", return_value=["fixture-model:latest"]))
+        stack.enter_context(mock.patch.object(ramgate, "installed_models", return_value=["fixture-model:latest"]))
+        stack.enter_context(mock.patch.object(ollama_ctl, "binary", return_value="/fixture/ollama"))
         stack.enter_context(mock.patch.object(ollama_ctl, "session", side_effect=lambda *a, **k: nullcontext()))
         forbidden = AssertionError("Unexpected external operation in isolated HTTP fixture")
         for module, names in ((ollama_ctl, ("start", "stop", "_post", "_get", "chat_messages")),

@@ -993,6 +993,25 @@ body.is-wide .gds-heading__title { text-align: left; }
 .note--short { min-height: 72px; }
 
 /* connectors */
+.connector-builder { text-align: left; border: 1px solid #ddd; padding: 20px; border-radius: 8px; }
+.connector-builder .row { justify-content: flex-start; }
+.connector-builder label { font-size: 13px; }
+.connector-builder .note { width: 100%; box-sizing: border-box; }
+.connector-builder select { width: 100%; min-width: 0; }
+.connector-modes { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid #ddd; }
+.connector-modes button { font: inherit; font-size: 13px; padding: 10px 8px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: #666; cursor: pointer; }
+.connector-modes button[aria-pressed="true"] { color: #111; border-bottom-color: #111; font-weight: 600; }
+.connector-examples { display: flex; flex-wrap: wrap; gap: 6px; }
+.connector-examples button { font: inherit; font-size: 12px; background: #f7f7f7; border: 1px solid #ddd; border-radius: 4px; padding: 6px 10px; cursor: pointer; }
+.connector-context > summary, .connector-discovery > summary { cursor: pointer; font-size: 13px; padding: 10px 0; }
+.connector-context textarea { margin-top: 8px; }
+.connector-discovery { margin-top: 24px; text-align: left; }
+.connector-message { font-size: 13px; line-height: 1.6; padding: 12px; background: #f7f7f7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.connector-message.is-error { color: #a52828; }
+.connector-builder [hidden] { display: none !important; }
+.connector-builder .params__row { grid-template-columns: 1fr 1fr; border: 1px solid #eee; padding: 8px; }
+.connector-builder .params__row [data-p="del"] { justify-self: end; }
+@media (max-width: 480px) { .connector-builder { padding: 14px; } .connector-modes { gap: 0; } .connector-modes button { padding: 10px 6px; font-size: 12px; } }
 .connector-list { display: flex; flex-direction: column; gap: 8px; text-align: left; }
 .connector-row {
   display: flex;
@@ -1007,7 +1026,7 @@ body.is-wide .gds-heading__title { text-align: left; }
 .connector-row.is-off { background: #fafafa; }
 .connector-row.is-off b { color: #9e9e9e; }
 .connector-row--found { border-style: dashed; }
-.connector-row__main { flex: 1; min-width: 0; }
+.connector-row__main { flex: 1; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .connector-row__head {
   display: flex;
   align-items: center;

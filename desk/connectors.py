@@ -347,8 +347,19 @@ def redact_url(url: str) -> str:
 
 
 def _redact_value(value: str) -> str:
-    """`${ENV}` 참조는 그대로 두고 리터럴 값은 가린다."""
-    return value if _VAR_RE.fullmatch(value.strip() or " ") else "<redacted>"
+    """Keep a pure env reference, optionally prefixed by the literal Bearer scheme.
+
+    Defaults and every other literal remain private: `${KEY:-secret}` must not
+    expose its fallback, and `Bearer secret${KEY}` is not a safe placeholder.
+    """
+    text = value.strip()
+    reference = text
+    if text.lower().startswith("bearer "):
+        reference = text[len("Bearer "):].strip()
+    match = _VAR_RE.fullmatch(reference)
+    if match and match.group(2) is None:
+        return text
+    return "<redacted>"
 
 
 # ---------------------------------------------------------------- env resolution
@@ -775,7 +786,8 @@ def fill_template(template: str, args: dict[str, Any], quoter: Callable[[str], s
     def _sub(match: re.Match[str]) -> str:
         return quoter(str(args.get(match.group(1), "")))
 
-    return re.sub(r"\{([A-Za-z0-9_]+)\}", _sub, template)
+    # `${ENV}` belongs to environment expansion, never model-supplied args.
+    return re.sub(r"(?<!\$)\{([A-Za-z0-9_-]+)\}", _sub, template)
 
 
 def _test_http(con: dict) -> dict:
@@ -789,6 +801,9 @@ def _test_http(con: dict) -> dict:
         except urllib.error.HTTPError as exc:
             if method == "HEAD" and exc.code in (405, 501):
                 continue
+            if exc.code in (401, 403):
+                return {"ok": False, "status": exc.code, "url": redact_url(url),
+                        "error": f"HTTP {exc.code}: 인증 정보 또는 접근 권한을 확인하세요."}
             return {"ok": exc.code < 500, "status": exc.code, "url": redact_url(url)}
         except Exception as exc:
             return {"ok": False, "status": None, "error": str(exc), "url": redact_url(url)}

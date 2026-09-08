@@ -188,20 +188,71 @@
       <div class="gds-heading">
         <p class="gds-heading__title">연동</p>
       </div>
-      <p class="legend legend--left">MCP 서버 · CLI 명령 · HTTP API · 스킬을 등록해 두고, 각 자동화에서 필요한 것만 골라 붙입니다.</p>
-      <h2 class="sec-title">등록된 연동</h2>
-      <div class="connector-list" id="conList"></div>
-      <h2 class="sec-title">이 맥에서 찾은 연동</h2>
-      <div class="connector-list" id="conDiscovered"></div>
-      <h2 class="sec-title">직접 추가</h2>
+      <p class="legend legend--left">필요한 도구를 말로 설명해 보세요. CLI · HTTP API · OpenAPI · MCP · 스킬을 추가하고 자동화에서 골라 쓸 수 있습니다.</p>
+      <div class="connector-builder">
+        <div class="connector-modes" role="group" aria-label="연동 추가 방식">
+          <button type="button" data-con-mode="ai" aria-pressed="true">말로 추가</button>
+          <button type="button" data-con-mode="openapi" aria-pressed="false">OpenAPI 가져오기</button>
+          <button type="button" data-con-mode="manual" aria-pressed="false">직접 입력</button>
+        </div>
+        <div id="conAIPanel" class="stack">
+          <label class="field-labeled--area" for="conAIPrompt">어떤 연동이 필요한가요?</label>
+          <textarea id="conAIPrompt" class="note" maxlength="6000" placeholder="예: gh로 특정 저장소의 열린 이슈를 조회하는 CLI를 붙여줘. 저장소 이름은 실행할 때 받을게."></textarea>
+          <div class="connector-examples" aria-label="요청 예시">
+            <button type="button" data-con-example="CLI">CLI 연결</button>
+            <button type="button" data-con-example="API">API 연결</button>
+            <button type="button" data-con-example="MCP">MCP 연결</button>
+            <button type="button" data-con-example="skill">스킬 연결</button>
+          </div>
+          <details class="connector-context">
+            <summary>도움말이나 API 설명 덧붙이기</summary>
+            <textarea id="conAIContext" class="note note--short" maxlength="8000" aria-label="연동 참고 자료" placeholder="CLI 도움말, API 주소·메서드·파라미터 설명 등을 붙여 넣으세요. OpenAPI JSON은 ‘OpenAPI 가져오기’에서 읽을 수 있습니다."></textarea>
+          </details>
+          <label for="conAIModel">초안을 만들 로컬 모델</label>
+          <select id="conAIModel" class="gds-text-field__input"><option value="">설치된 모델 확인 중…</option></select>
+          <p class="legend legend--left" id="conAIAvailability">초안을 만드는 동안만 Ollama를 사용합니다.</p>
+          <div class="row"><button type="button" class="gds-button gds-button--cta" id="conDraftBtn">AI로 초안 만들기</button></div>
+          <div id="conAIMessage" class="connector-message" role="status" aria-live="polite" hidden></div>
+          <div id="conFollowup" class="stack" hidden>
+            <label for="conAIReply">추가 정보 또는 수정 요청</label>
+            <textarea id="conAIReply" class="note note--short" maxlength="2000" placeholder="질문에 답하거나 바꾸고 싶은 부분을 적어 주세요."></textarea>
+            <div class="row"><button type="button" class="gds-button gds-button--secondary" id="conReplyBtn">반영해서 다시 만들기</button></div>
+          </div>
+        </div>
+        <div id="conOpenAPIPanel" class="stack" hidden>
+          <p class="legend legend--left">OpenAPI 3.x JSON 문서에서 요청 하나를 골라 HTTP 연동으로 만듭니다. API 요청은 실행하지 않습니다.</p>
+          <label for="conSpecUrl">문서 URL</label>
+          <input id="conSpecUrl" class="gds-text-field__input" type="url" placeholder="https://api.example.com/openapi.json" />
+          <label for="conSpecText">또는 JSON 문서 붙여넣기</label>
+          <textarea id="conSpecText" class="note note--short" maxlength="1048576" placeholder='{"openapi":"3.0.3","info":{...},"paths":{...}}'></textarea>
+          <div class="row"><button type="button" class="gds-button gds-button--cta" id="conSpecReadBtn">문서 읽기</button></div>
+          <div id="conSpecMessage" class="connector-message" role="status" aria-live="polite" hidden></div>
+          <div id="conOperations" class="stack" hidden>
+            <label for="conOperation">연결할 요청</label>
+            <select id="conOperation" class="gds-text-field__input"></select>
+            <div class="row"><button type="button" class="gds-button gds-button--secondary" id="conSpecDraftBtn">이 요청으로 초안 만들기</button></div>
+          </div>
+        </div>
+      <div class="stack" id="conReview" hidden>
+        <h2 class="sec-title" id="conReviewTitle">연동 초안</h2>
+        <p class="legend legend--left" id="conReviewSummary"></p>
       <div class="stack" id="conForm">
         <div id="conKindDrop"></div>
         <div class="stack" id="conFields"></div>
         <p class="error" id="conError" hidden></p>
         <div class="row">
-          <button type="button" class="gds-button gds-button--cta" id="conSaveBtn">추가</button>
+          <button type="button" class="gds-button gds-button--cta" id="conSaveBtn">확인하고 연동 추가</button>
         </div>
+        <p class="legend legend--left">추가한 뒤 자동화의 ‘연동’에서 선택하세요. 추가는 등록 단계이며 설치·로그인이나 작업 실행을 뜻하지 않습니다.</p>
       </div>
+      </div>
+      </div>
+      <h2 class="sec-title">등록된 연동</h2>
+      <div class="connector-list" id="conList"></div>
+      <details class="connector-discovery">
+        <summary>이 맥에서 찾은 MCP·스킬 보기</summary>
+        <div class="connector-list" id="conDiscovered"></div>
+      </details>
     </section>
 
     <section id="viewSettings" hidden>
