@@ -197,7 +197,7 @@ class Locking(TempData):
         with state.locked():
             with state.locked():
                 state.save_config(state.load_config())
-        self.assertEqual(state.load_config()["alerts"], {"macos": True, "sound": True, "webhook": ""})
+            self.assertEqual(state.load_config()["alerts"], {"macos": True, "macos_mode": "notification", "sound": True, "webhook": ""})
 
 
 class Crontab(unittest.TestCase):

@@ -11,6 +11,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import queue
 import os
 import shlex
 import signal
@@ -19,6 +20,8 @@ import socket
 import stat
 import sys
 import tempfile
+import threading
+import time
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -254,7 +257,7 @@ def run(
     timeout: float | None = None,
     *, context: ToolContext | None = None,
 ) -> str:
-    """도구 하나 실행. 실패는 예외 대신 "도구 실패: ..." 문자열. timeout 은 MCP 호출에만 적용(남은 예산 클램프용)."""
+    """도구 하나 실행. 실패는 예외 대신 "도구 실패: ..." 문자열. timeout 은 HTTP/MCP 호출의 남은 실행 예산입니다."""
     perm = permission or "workspace"
     args = args if isinstance(args, dict) else {}
     try:
@@ -265,9 +268,9 @@ def run(
         if name == "run_cli":
             return _run_cli(str(args.get("command") or ""), perm)
         if name == "http_request":
-            return _http(str(args.get("method") or "GET"), str(args.get("url") or ""), args.get("body"), perm)
+            return _http(str(args.get("method") or "GET"), str(args.get("url") or ""), args.get("body"), perm, timeout=timeout)
         if name == "chrome_open":
-            return _chrome(str(args.get("url") or ""), perm)
+            return _chrome(str(args.get("url") or ""), perm, timeout=timeout)
         if name == "read_file":
             return _read_file(str(args.get("path") or ""), perm)
         target = context.targets.get(name)
@@ -277,7 +280,7 @@ def run(
         if name.startswith("cli__"):
             return _run_cli_connector(con, args, perm)
         if name.startswith("http__"):
-            return _run_http_connector(con, args, perm)
+            return _run_http_connector(con, args, perm, timeout=timeout)
         if name.startswith("mcp__"):
             if not _mcp_allowed(tool_metadata, perm):
                 raise RuntimeError("읽기 권한에서는 쓰기 MCP 도구를 실행하지 않습니다.")
@@ -301,7 +304,7 @@ def _run_cli_connector(con: dict, args: dict, perm: str) -> str:
     return _cli_result(sandbox_run(argv, perm, int(con.get("timeout") or 60)))
 
 
-def _run_http_connector(con: dict, args: dict, perm: str) -> str:
+def _run_http_connector(con: dict, args: dict, perm: str, timeout: float | None = None) -> str:
     method = str(con.get("method") or "GET").upper()
     if perm == "read" and method != "GET":
         raise RuntimeError("읽기 권한에서는 GET만 됩니다.")
@@ -313,7 +316,7 @@ def _run_http_connector(con: dict, args: dict, perm: str) -> str:
     if method == "POST":
         body = connectors_mod.fill_template(con.get("body_template") or "", values, lambda v: json.dumps(v)[1:-1])
         headers.setdefault("Content-Type", "application/json")
-    return _fetch(method, url, body, headers, allow_local=True)
+    return _fetch(method, url, body, headers, allow_local=True, timeout=timeout)
 
 
 def _run_mcp_connector(con: dict, tool_name: str, args: dict, mcp_clients: dict[str, "MCPClient"], timeout: float | None, perm: str = "workspace") -> str:
@@ -595,30 +598,64 @@ def _is_local_host(host: str) -> bool:
     return not addr.is_global or bool(getattr(addr, "ipv4_mapped", None) and not addr.ipv4_mapped.is_global)
 
 
-def _destinations(url: str, allow_local: bool = False) -> tuple[Any, list]:
+HTTP_TIMEOUT = 20.0
+
+
+def _remaining_http(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("HTTP deadline exceeded")
+    return remaining
+
+
+def _resolve_addresses(host: str, port: int, deadline: float | None) -> list:
+    if deadline is None:
+        return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    # The OS resolver has no per-call timeout. Bound the caller without waiting
+    # for a stuck resolver; this daemon only resolves DNS, never sends HTTP.
+    answers: queue.Queue = queue.Queue(maxsize=1)
+    def resolve():
+        try:
+            answers.put((socket.getaddrinfo(host, port, type=socket.SOCK_STREAM), None))
+        except Exception as exc:
+            answers.put((None, exc))
+    threading.Thread(target=resolve, daemon=True, name="desk-http-dns").start()
+    try:
+        result, error = answers.get(timeout=_remaining_http(deadline))
+    except queue.Empty as exc:
+        raise TimeoutError("DNS resolution timed out") from exc
+    if error is not None:
+        raise error
+    return result
+
+
+def _destinations(url: str, allow_local: bool = False, deadline: float | None = None) -> tuple[Any, list]:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
         raise RuntimeError("인증 정보가 없는 http(s) URL만 됩니다.")
     if not allow_local and _is_local_host(parsed.hostname):
         raise RuntimeError("localhost 또는 사설 주소는 도구로 호출하지 않습니다.")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    addresses = _resolve_addresses(parsed.hostname, port, deadline)
     if not addresses or (not allow_local and any(_is_local_host(item[4][0]) for item in addresses)):
         raise RuntimeError("localhost 또는 사설 주소로 해석되는 주소는 호출하지 않습니다.")
     return parsed, addresses
 
 
-def _pinned_connection(parsed: Any, addresses: list) -> http.client.HTTPConnection:
+def _pinned_connection(parsed: Any, addresses: list, deadline: float | None = None) -> http.client.HTTPConnection:
     connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-    connection = connection_type(parsed.hostname, parsed.port, timeout=20)
+    timeout = _remaining_http(deadline) if deadline is not None else HTTP_TIMEOUT
+    connection = connection_type(parsed.hostname, parsed.port, timeout=timeout)
 
-    def connect_validated(_address: Any, timeout: float = 20, source_address: Any = None) -> socket.socket:
+    def connect_validated(_address: Any, timeout: float = HTTP_TIMEOUT, source_address: Any = None) -> socket.socket:
         last = None
         for family, socktype, proto, _, destination in addresses:
             sock = socket.socket(family, socktype, proto)
             try:
-                sock.settimeout(timeout)
+                sock.settimeout(_remaining_http(deadline) if deadline is not None else timeout)
                 sock.connect(destination)  # Already-resolved sockaddr: no second DNS lookup.
+                if deadline is not None:
+                    sock.settimeout(_remaining_http(deadline))  # TLS uses the remaining budget too.
                 return sock
             except OSError as exc:
                 last = exc
@@ -629,52 +666,101 @@ def _pinned_connection(parsed: Any, addresses: list) -> http.client.HTTPConnecti
     return connection
 
 
-def _fetch(method: str, url: str, body: Any, headers: dict[str, str], allow_local: bool = False) -> str:
+def _interrupt_http(connection: http.client.HTTPConnection, response_socket: list | None = None) -> None:
+    # Socket inactivity timeouts alone do not stop dribbling headers/body.
+    sock = response_socket[0] if response_socket else connection.sock
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+def _fetch(method: str, url: str, body: Any, headers: dict[str, str], allow_local: bool = False,
+           timeout: float | None = None) -> str:
+    limit = min(HTTP_TIMEOUT, float(timeout)) if timeout is not None else HTTP_TIMEOUT
+    deadline = time.monotonic() + max(0.0, limit)
     data = None
     headers = dict(headers)
     if method == "POST":
         raw = body if isinstance(body, str) else json.dumps(body or {})
         data = str(raw).encode("utf-8")
         headers.setdefault("Content-Type", "application/json")
-    for _ in range(6):
-        parsed, addresses = _destinations(url, allow_local)
-        connection = _pinned_connection(parsed, addresses)
-        try:
-            path = parsed.path or "/"
-            if parsed.query:
-                path += "?" + parsed.query
-            connection.request(method, path, body=data, headers=headers)
-            response = connection.getresponse()
-            if response.status in (301, 302, 303, 307, 308) and response.getheader("Location"):
-                target = urljoin(url, response.getheader("Location"))
-                next_parsed = urlparse(target)
-                if (parsed.scheme, parsed.hostname, parsed.port) != (next_parsed.scheme, next_parsed.hostname, next_parsed.port):
-                    headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "cookie", "proxy-authorization", "host")}
-                if response.status == 303 or (response.status in (301, 302) and method == "POST"):
-                    method, data = "GET", None
-                    headers = {k: v for k, v in headers.items() if k.lower() not in ("content-type", "content-length")}
-                url = target
-                continue
-            if response.status >= 400:
-                raise RuntimeError(f"HTTP {response.status}")
-            return response.read(MAX_OUT * 2).decode("utf-8", errors="replace")[:MAX_OUT]
-        finally:
-            connection.close()
-    raise RuntimeError("HTTP 리디렉션 횟수를 초과했습니다.")
+    stage = "DNS"
+    try:
+        for _ in range(6):
+            stage = "DNS"
+            _remaining_http(deadline)
+            parsed, addresses = _destinations(url, allow_local, deadline)
+            connection = _pinned_connection(parsed, addresses, deadline)
+            response_socket: list = []
+            timer = threading.Timer(_remaining_http(deadline), _interrupt_http, args=(connection, response_socket))
+            timer.daemon = True
+            timer.start()
+            try:
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += "?" + parsed.query
+                stage = "TCP/TLS"
+                connection.connect()
+                stage = "request"
+                connection.sock.settimeout(_remaining_http(deadline))
+                connection.request(method, path, body=data, headers=headers)
+                stage = "response headers"
+                connection.sock.settimeout(_remaining_http(deadline))
+                response = connection.getresponse()
+                sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                if sock is not None:
+                    response_socket.append(sock)
+                    sock.settimeout(_remaining_http(deadline))
+                _remaining_http(deadline)
+                if response.status in (301, 302, 303, 307, 308) and response.getheader("Location"):
+                    target = urljoin(url, response.getheader("Location"))
+                    next_parsed = urlparse(target)
+                    if (parsed.scheme, parsed.hostname, parsed.port) != (next_parsed.scheme, next_parsed.hostname, next_parsed.port):
+                        headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "cookie", "proxy-authorization", "host")}
+                    if response.status == 303 or (response.status in (301, 302) and method == "POST"):
+                        method, data = "GET", None
+                        headers = {k: v for k, v in headers.items() if k.lower() not in ("content-type", "content-length")}
+                    url = target
+                    continue
+                if response.status >= 400:
+                    raise RuntimeError(f"HTTP {response.status}")
+                stage = "response body"
+                chunks = bytearray()
+                while len(chunks) < MAX_OUT * 2:
+                    _remaining_http(deadline)
+                    chunk = response.read1(MAX_OUT * 2 - len(chunks))
+                    _remaining_http(deadline)
+                    if not chunk:
+                        if isinstance(response.length, int) and response.length > 0:
+                            raise http.client.IncompleteRead(bytes(chunks), response.length)
+                        break
+                    chunks.extend(chunk)
+                return chunks.decode("utf-8", errors="replace")[:MAX_OUT]
+            finally:
+                timer.cancel()
+                connection.close()
+        raise RuntimeError("HTTP 리디렉션 횟수를 초과했습니다.")
+    except (OSError, http.client.HTTPException) as exc:
+        host = urlparse(url).hostname or "unknown host"
+        if isinstance(exc, TimeoutError) or time.monotonic() >= deadline:
+            raise TimeoutError(f"HTTP {method} {host}: {stage} timed out after {max(0.0, limit):g}s") from exc
+        raise RuntimeError(f"HTTP {method} {host}: {stage} failed ({type(exc).__name__}: {exc})") from exc
 
 
-def _http(method: str, url: str, body: Any, perm: str) -> str:
+def _http(method: str, url: str, body: Any, perm: str, timeout: float | None = None) -> str:
     method = (method or "GET").upper()
     if method not in ("GET", "POST"):
         raise RuntimeError("GET 또는 POST만 됩니다.")
     if perm == "read" and method != "GET":
         raise RuntimeError("읽기 권한에서는 GET만 됩니다.")
-    return _fetch(method, url, body, {"User-Agent": "Free-AI-Scheduler"})
+    return _fetch(method, url, body, {"User-Agent": "Free-AI-Scheduler"}, timeout=timeout)
 
 
-def _chrome(url: str, perm: str) -> str:
+def _chrome(url: str, perm: str, timeout: float | None = None) -> str:
     # Browser navigation would resolve again and follow unvalidated redirects.
-    page = _http("GET", url, None, perm)
+    page = _http("GET", url, None, perm, timeout=timeout)
     return f"주소에서 가져온 텍스트: {url}\n\n{page[:4000]}"
 
 

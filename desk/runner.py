@@ -18,7 +18,7 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 # Allow `python3 desk/runner.py` from cron.
@@ -41,6 +41,9 @@ TRIM_HEAD = 800
 TRIM_TAIL = 800
 RUNS_MAX_BYTES = 5 * 1024 * 1024
 RUNS_KEEP_LINES = 500
+TOOL_RESULT_MAX_CHARS = 6000
+TOOL_RESULTS_TOTAL_CHARS = 24000
+TOOL_RESULTS_MAX_ENTRIES = 64
 STATUS_LABEL = {"ok": "성공", "fail": "실패", "skipped": "건너뜀", "deferred_timeout": "시간초과", "aborted": "중단됨", "empty": "빈 응답"}
 
 
@@ -74,12 +77,51 @@ class TaskResult:
     text: str = ""
     error: str | None = None
     tools_used: list[str] = field(default_factory=list)
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
+    tool_results_omitted: int = 0
+    tool_results_truncated: bool = False
     truncated: bool = False
     loops: int = 0
 
     def note_tool(self, name: str) -> None:
         if name not in self.tools_used:
             self.tools_used.append(name)
+
+
+    def note_tool_result(self, name: str, output: str, *, ok: bool,
+                         error_type: str | None = None, scrub: Callable[[str], str] | None = None) -> None:
+        """Bound evidence independently of the model transcript; redact before truncating."""
+        scrub = scrub or (lambda text: text)
+        if len(self.tool_results) >= TOOL_RESULTS_MAX_ENTRIES:
+            self.tool_results_omitted += 1
+            self.tool_results_truncated = True
+            if ok:
+                return
+            self.tool_results.pop()  # Preserve a terminal failure even after many successful calls.
+        name = scrub(str(name))[:200]
+        output = scrub(str(output))
+        remaining = max(0, TOOL_RESULTS_TOTAL_CHARS - sum(len(row["output"]) for row in self.tool_results))
+        if not ok:
+            # Keep the terminal failure message even when earlier successes used
+            # the output budget; mark the displaced evidence as truncated.
+            needed = min(len(output), TOOL_RESULT_MAX_CHARS) - remaining
+            for previous in reversed(self.tool_results):
+                if needed <= 0:
+                    break
+                removed = min(needed, len(previous["output"]))
+                if removed:
+                    previous["output"] = previous["output"][:-removed]
+                    previous["truncated"] = True
+                    self.tool_results_truncated = True
+                    remaining += removed
+                    needed -= removed
+        excerpt = output[:min(TOOL_RESULT_MAX_CHARS, remaining)]
+        shortened = len(excerpt) < len(output)
+        row = {"name": name, "output": excerpt, "ok": bool(ok), "truncated": shortened}
+        if error_type:
+            row["error_type"] = scrub(str(error_type))[:100]
+        self.tool_results.append(row)
+        self.tool_results_truncated |= shortened
 
 
 @dataclass
@@ -292,6 +334,7 @@ def _execute(ctx: RunContext, verdict: dict, waited_s: int) -> dict:
     budget = Budget.minutes(ctx.max_minutes)
     cons = _collect_connectors(ctx.connector_ids)
     warnings = _run_warnings(ctx, cons)
+    task = TaskResult()
     try:
         with ollama_ctl.session(model_used):
             task = run_task(
@@ -307,7 +350,7 @@ def _execute(ctx: RunContext, verdict: dict, waited_s: int) -> dict:
                 budget=budget,
             )
     except Exception as exc:  # 실패도 기록으로 남긴다
-        return _record(ctx, "fail", error=str(exc) or exc.__class__.__name__, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
+        return _record(ctx, "fail", task=task, error=str(exc) or exc.__class__.__name__, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
     if task.error is not None:
         return _record(ctx, "fail", task=task, error=task.error, verdict=verdict,
                        waited_s=waited_s, model_used=model_used, warnings=warnings)
@@ -362,7 +405,7 @@ def _finish(job: dict, ctx: RunContext, result: dict) -> None:
     if jobs_mod.should_alert(job, ok):
         if ok:
             wait = f" · 램 대기 {result.get('waited_s', 0) // 60}분" if result.get("waited_s", 0) >= 60 else ""
-            body = f"{ctx.title} · {result['seconds']}s{wait}\n{(result.get('output') or '')[:120]}"
+            body = f"{ctx.title} · {result['seconds']}s{wait}\n{result.get('output') or ''}"
         else:
             body = f"{ctx.title}\n{result.get('error') or ''}"
         heading = f"Free AI Scheduler {STATUS_LABEL.get(status, status)}"
@@ -455,6 +498,9 @@ def _desk_run(
     mcp_cons = [c for c in cons if c.get("kind") == "mcp"]
     clients: dict = {}
     host = None
+    result = TaskResult()
+    connector_ids = [str(con["id"]) for con in cons if con.get("id")]
+    scrub = lambda text: _scrub_secrets(text, connector_ids)
     try:
         if mcp_cons:
             from desk import mcp_host as host
@@ -467,7 +513,6 @@ def _desk_run(
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ]
-        result = TaskResult()
         for _ in range(loops):
             payload = ollama_ctl.chat_messages(model, messages, effort=effort, tools=spec, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
             if payload.get("tools_dropped"):
@@ -481,11 +526,20 @@ def _desk_run(
                 return result
             for call in calls:
                 budget.check()
-                output = tools.run(call["name"], call.get("arguments") or {}, permission, clients,
-                                   timeout=budget.remaining(), context=tool_context)
+                failures_before = len(tool_context.failures)
+                try:
+                    output = tools.run(call["name"], call.get("arguments") or {}, permission, clients,
+                                       timeout=budget.remaining(), context=tool_context)
+                except Exception as exc:
+                    result.note_tool(call["name"])
+                    result.note_tool_result(call["name"], str(exc) or type(exc).__name__, ok=False,
+                                            error_type=type(exc).__name__, scrub=scrub)
+                    raise
                 result.note_tool(call["name"])
-                if tool_context.failures:
-                    failure = tool_context.failures[-1]
+                failure = tool_context.failures[-1] if len(tool_context.failures) > failures_before else None
+                result.note_tool_result(call["name"], output, ok=failure is None,
+                                        error_type=failure.error_type if failure else None, scrub=scrub)
+                if failure:
                     result.error = f"도구 '{failure.name}' 실패 ({failure.error_type}): {failure.message}"
                     result.text = ""
                     return result  # No model summary after missing/failed evidence.
@@ -495,6 +549,10 @@ def _desk_run(
         payload = ollama_ctl.chat_messages(model, messages, effort=effort, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
         result.loops += 1
         result.text = ollama_ctl.extract_text(payload)
+        return result
+    except Exception as exc:
+        result.error = str(exc) or type(exc).__name__
+        result.text = ""
         return result
     finally:
         if host is not None:
@@ -606,6 +664,13 @@ def _record(
     now = datetime.now(SEOUL)
     output_text = _scrub_secrets(task.text, ctx.connector_ids) if status == "ok" else ""
     error_text = None if status == "ok" else _scrub_secrets(error or STATUS_LABEL.get(status, status), ctx.connector_ids)
+    evidence = TaskResult()
+    for row in task.tool_results:
+        evidence.note_tool_result(row.get("name") or "", row.get("output") or "", ok=bool(row.get("ok")),
+                                  error_type=row.get("error_type"),
+                                  scrub=lambda text: _scrub_secrets(text, ctx.connector_ids))
+        if row.get("truncated"):
+            evidence.tool_results[-1]["truncated"] = True
     return {
         "id": ctx.run_id,
         "job_id": ctx.job_id,
@@ -626,6 +691,9 @@ def _record(
         "ram_action": verdict.get("action"),
         "waited_s": int(waited_s),
         "tools_used": list(task.tools_used),
+        "tool_results": evidence.tool_results,
+        "tool_results_omitted": task.tool_results_omitted + evidence.tool_results_omitted,
+        "tool_results_truncated": task.tool_results_truncated or evidence.tool_results_truncated,
         "truncated": bool(task.truncated),
         "loops": task.loops,
         "effort": ctx.effort,

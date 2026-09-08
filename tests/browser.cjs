@@ -65,6 +65,15 @@ const path = require('node:path');
     assert.deepEqual(errors, []);
     fs.mkdirSync(path.join(root, 'test-results'), {recursive: true});
     await page.screenshot({path: path.join(root, 'test-results', 'job-form-mobile.png'), fullPage: true});
+    await page.goto(base + '/settings', {waitUntil: 'networkidle'});
+    await page.locator('#alertDialog').check();
+    const alertsSaved = page.waitForResponse(r => r.url() === base + '/api/alerts' && r.request().method() === 'POST');
+    await page.locator('#alertSaveBtn').click();
+    assert.equal((await (await alertsSaved).json()).alerts.macos_mode, 'dialog');
+    await page.reload({waitUntil: 'networkidle'});
+    assert.equal(await page.locator('#alertDialog').isChecked(), true);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    assert.deepEqual(errors, []);
     console.log('Browser regression passed: create, edit, low effort, memory controls, trial success/empty, mobile form.');
   } finally {
     if (browser) await browser.close();

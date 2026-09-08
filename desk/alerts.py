@@ -15,6 +15,8 @@ SEOUL = ZoneInfo("Asia/Seoul")
 APP_URL = "http://127.0.0.1:8788"
 TITLE_MAX = 80
 BODY_MAX = 180
+DIALOG_BODY_MAX = 2400
+DIALOG_SECONDS = 45
 
 
 def notify(
@@ -30,7 +32,10 @@ def notify(
     alerts = load_config().get("alerts") or {}
     result: dict[str, Any] = {"macos": None, "webhook": None}
     if alerts.get("macos", True):
-        result["macos"] = _macos(title, body, ok=ok, kind=kind, sound=bool(alerts.get("sound", True)))
+        if alerts.get("macos_mode") == "dialog":
+            result["macos"] = _macos_dialog(title, body, sound=bool(alerts.get("sound", True)))
+        else:
+            result["macos"] = _macos(title, body, ok=ok, kind=kind, sound=bool(alerts.get("sound", True)))
     webhook = str(alerts.get("webhook") or "").strip()
     if webhook:
         payload = {
@@ -71,7 +76,41 @@ def _macos(title: str, body: str, ok: bool, kind: str, sound: bool) -> dict[str,
         proc = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=15)
     except (subprocess.SubprocessError, OSError) as exc:
         return {"ok": False, "code": None, "stderr": str(exc)[:200]}
-    return {"ok": proc.returncode == 0, "code": proc.returncode, "stderr": (proc.stderr or "").strip()[:200]}
+    # Exit zero means accepted by macOS, not that a banner or sound reached the user.
+    return {"ok": proc.returncode == 0, "mode": "notification", "submitted": proc.returncode == 0,
+            "visible": None, "code": proc.returncode, "stderr": (proc.stderr or "").strip()[:200]}
+
+
+def _macos_dialog(title: str, body: str, sound: bool) -> dict[str, Any]:
+    """Opt-in foreground result window, bounded even when nobody acknowledges it.
+
+    The job's Ollama session has already ended. Its lock stays held until this
+    window closes (at most 45 seconds); once claims prevent replay on restart.
+    No other application's UI or global notification preferences are changed.
+    """
+    statements = ["on run argv", "activate"]
+    if sound:
+        statements.append("beep 1")
+    statements.extend([
+        f'set answer to display dialog (item 2 of argv) with title (item 1 of argv) '
+        f'buttons {{"확인"}} default button "확인" giving up after {DIALOG_SECONDS}',
+        'if gave up of answer then', 'return "expired"', 'end if',
+        'return "acknowledged"', 'end run',
+    ])
+    argv = ["osascript"]
+    for statement in statements:
+        argv.extend(["-e", statement])
+    argv.extend(["--", _clean(title, TITLE_MAX), str(body or "")[:DIALOG_BODY_MAX]])
+    try:
+        proc = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=DIALOG_SECONDS + 5)
+    except (subprocess.SubprocessError, OSError) as exc:
+        return {"ok": False, "mode": "dialog", "acknowledged": False, "expired": False,
+                "code": None, "stderr": str(exc)[:200]}
+    receipt = (proc.stdout or "").strip()
+    success = proc.returncode == 0 and receipt in ("acknowledged", "expired")
+    return {"ok": success, "mode": "dialog", "acknowledged": success and receipt == "acknowledged",
+            "expired": success and receipt == "expired", "code": proc.returncode,
+            "stderr": (proc.stderr or "").strip()[:200]}
 
 
 def _webhook(url: str, payload: dict[str, Any]) -> dict[str, Any]:

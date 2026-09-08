@@ -56,6 +56,17 @@ class ApiIntegration(unittest.TestCase):
         with mock.patch.object(http_api.ollama_ctl, "start", side_effect=AssertionError("Must stay idle")):
             self.assertEqual(self.request("GET", "/api/status")[0], 200)
 
+    def test_alert_mode_persists_without_sending(self):
+        headers = {"X-Requested-With": "free-ai-scheduler"}
+        from desk import alerts
+        with mock.patch.object(alerts, "notify") as notify:
+            code, result = self.request("POST", "/api/alerts", {"macos_mode": "dialog"}, headers)
+            self.assertEqual(code, 200)
+            self.assertEqual(result["alerts"]["macos_mode"], "dialog")
+            self.assertEqual(self.request("POST", "/api/alerts", {"macos_mode": "unknown"}, headers)[0], 400)
+            self.assertEqual(self.request("GET", "/api/status")[1]["alerts"]["macos_mode"], "dialog")
+        notify.assert_not_called()
+
 
 class InstallStreamCleanup(unittest.TestCase):
     def handler(self):

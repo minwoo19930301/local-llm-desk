@@ -1359,6 +1359,7 @@ function paintCron(data) {
 async function showSettings(status) {
   const alerts = (status && status.alerts) || {};
   document.getElementById("alertMacos").checked = alerts.macos !== false;
+  document.getElementById("alertDialog").checked = alerts.macos_mode === "dialog";
   document.getElementById("alertSound").checked = alerts.sound !== false;
   document.getElementById("alertWebhook").value = alerts.webhook || "";
   document.getElementById("alertResult").textContent = "";
@@ -1374,6 +1375,7 @@ async function showSettings(status) {
 function alertsPayload() {
   return {
     macos: document.getElementById("alertMacos").checked,
+    macos_mode: document.getElementById("alertDialog").checked ? "dialog" : "notification",
     sound: document.getElementById("alertSound").checked,
     webhook: document.getElementById("alertWebhook").value.trim(),
   };
@@ -1385,7 +1387,8 @@ function alertResultLine(r) {
   const bits = [];
   const m = r.macos;
   if (!m) bits.push("macOS 꺼짐");
-  else if (m.ok) bits.push("macOS ✓");
+  else if (m.ok && m.mode === "dialog") bits.push(m.acknowledged ? "확인 창 · 확인 누름" : "확인 창 · 45초 후 닫힘 (확인 안 됨)");
+  else if (m.ok) bits.push("macOS 전달 요청 완료 · 실제 표시는 시스템 설정에 따름");
   else bits.push(`macOS ✗ ${m.stderr || (m.code != null ? "code " + m.code : "")}`.trim());
   const w = r.webhook;
   if (!w) bits.push("웹훅 없음");

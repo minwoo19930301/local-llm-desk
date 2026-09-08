@@ -625,12 +625,16 @@ def _clean_webhook(raw: Any) -> str:
 @route("POST", r"/api/alerts")
 def _alerts_save(req: Request) -> Result:
     body = req.body
+    if "macos_mode" in body and body["macos_mode"] not in ("notification", "dialog"):
+        raise ValueError("macOS 알림 방식은 notification 또는 dialog여야 합니다.")
     with locked():
         cfg = load_config()
         alerts = cfg["alerts"]
         for key in ("macos", "sound"):
             if key in body:
                 alerts[key] = bool(body[key])
+        if "macos_mode" in body:
+            alerts["macos_mode"] = body["macos_mode"]
         if "webhook" in body:
             alerts["webhook"] = _clean_webhook(body["webhook"])
         save_config(cfg)
