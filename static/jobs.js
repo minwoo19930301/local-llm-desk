@@ -24,6 +24,7 @@ const SCHEDULE = {
   weekdays: "평일",
   weekend: "주말",
   once_1m: "1분 뒤 한 번",
+  once_5m: "5분 뒤 한 번 · 앱 실행 중",
 };
 
 const STATUS_LABEL = {
@@ -32,6 +33,7 @@ const STATUS_LABEL = {
   skipped: "건너뜀",
   deferred_timeout: "시간초과",
   aborted: "중단됨",
+  empty: "빈 응답",
 };
 
 const KIND_LABEL = { mcp: "MCP", cli: "CLI", http: "HTTP", skill: "스킬" };
@@ -53,8 +55,13 @@ const CTX_BY_EFFORT = { low: 4096, medium: 8192, high: 16384 };
 const FORM = {
   permission: [
     { id: "read", name: "읽기만 · 조회" },
-    { id: "workspace", name: "이 앱이 있는 폴더만", selected: true },
-    { id: "machine", name: "이 컴퓨터 전체" },
+    { id: "workspace", name: "작업 폴더 안에서", selected: true },
+    { id: "machine", name: "이 컴퓨터 · 자격 증명 폴더 제외" },
+  ],
+  ramPolicy: [
+    { id: "defer", name: "여유 메모리가 생길 때까지 대기", selected: true },
+    { id: "skip", name: "이번 실행 건너뛰기" },
+    { id: "downgrade", name: "더 작은 모델로 실행" },
   ],
   preset: [
     { id: "save", name: "저장만", selected: true },
@@ -67,6 +74,7 @@ const FORM = {
     { id: "weekdays", name: "평일" },
     { id: "weekend", name: "주말" },
     { id: "once_1m", name: "1분 뒤 한 번" },
+    { id: "once_5m", name: "5분 뒤 한 번 · 앱 실행 중" },
     { id: "cron", name: "cron 식" },
   ],
   alert: [
@@ -172,7 +180,7 @@ function runStatus(run) {
 
 function statusClass(status) {
   if (status === "ok") return "ok";
-  if (status === "fail" || status === "deferred_timeout") return "bad";
+  if (status === "fail" || status === "deferred_timeout" || status === "empty") return "bad";
   return "muted";
 }
 
@@ -200,6 +208,7 @@ const collapsedResults = new Set();
 const expanded = new Set();
 const runHistory = new Map();
 const openRuns = new Set();
+const openEvidence = new Set();
 const rendered = new Map();
 
 /* ---------- form widgets ---------- */
@@ -208,6 +217,7 @@ function mountFormDrops() {
   DD.mount("permissionDrop", { label: "권한", items: FORM.permission });
   DD.mount("presetDrop", { label: "언제", items: FORM.preset, onChange: syncWhen });
   DD.mount("alertDrop", { label: "알림", items: FORM.alert });
+  DD.mount("ramPolicyDrop", { label: "메모리가 부족할 때", items: FORM.ramPolicy, onChange: syncPolicy });
   const range = document.getElementById("effortRange");
   if (range) {
     range.addEventListener("input", () => {
@@ -217,6 +227,20 @@ function mountFormDrops() {
     });
     setEffortLabel(Number(range.value));
   }
+}
+
+function syncPolicy(policy) {
+  document.getElementById("deferWrap").hidden = policy !== "defer";
+  document.getElementById("fallbackWrap").hidden = policy !== "downgrade";
+}
+
+function mountFallbackDrop(pick) {
+  const items = [{ id: "", name: "설치된 모델 중 자동 선택", selected: !pick }];
+  items.push(...installedModels.map((name) => ({ id: name, name, selected: name === pick })));
+  if (pick && !installedModels.includes(pick)) {
+    items.push({ id: pick, name: pick, line: "설치되지 않은 대체 모델", selected: true, disabled: true });
+  }
+  DD.mount("fallbackModelDrop", { label: "대체 모델", items });
 }
 
 function syncWhen(id) {
@@ -237,7 +261,7 @@ function setEffortLabel(n) {
 
 function effortValue() {
   const range = document.getElementById("effortRange");
-  return EFFORTS[Number(range && range.value) || 1] || "medium";
+  return EFFORTS[clampInt(range ? range.value : "1", 0, 2, 1)];
 }
 
 function setEffortValue(id) {
@@ -779,7 +803,7 @@ function paintTools(selected) {
     items: [
       { id: "cli", name: "CLI", line: "이 자동화에서 셸 명령을 실행", selected: on.has("cli") },
       { id: "http", name: "API", line: "이 자동화에서 HTTP를 호출", selected: on.has("http") },
-      { id: "chrome", name: "Chrome", line: "이 자동화에서 브라우저를 염", selected: on.has("chrome") },
+      { id: "chrome", name: "웹 페이지 읽기", line: "공개 웹 페이지의 내용을 가져옴", selected: on.has("chrome") },
     ],
   });
 }
@@ -978,6 +1002,21 @@ function lastRunHtml(lr) {
   return `<span class="${statusClass(st)}">${label}${sec}</span>${when}${why}`;
 }
 
+function toolResultsHtml(r) {
+  const rows = Array.isArray(r.tool_results) ? r.tool_results.filter((row) => row && typeof row === "object") : [];
+  if (!rows.length) return "";
+  const omitted = Math.max(0, Math.floor(Number(r.tool_results_omitted) || 0));
+  const limited = r.tool_results_truncated || omitted > 0;
+  return `<details class="run-result run-evidence" data-evidence="${escapeHtml(r.id || "")}"${openEvidence.has(String(r.id || "")) ? " open" : ""}>
+    <summary>조회 원문 · ${rows.length}건</summary>
+    ${limited ? `<p class="legend legend--left">보관 한도로 일부 출력이 생략되었습니다.${omitted ? ` 기록하지 못한 도구 실행 ${omitted}건.` : ""}</p>` : ""}
+    ${rows.map((row, index) => `<div class="run-evidence__entry">
+      <p class="meta">${index + 1}. ${escapeHtml(row.name || "도구")} · ${row.ok ? "성공" : "실패"}${row.error_type ? ` · ${escapeHtml(row.error_type)}` : ""}${row.truncated ? " · 원문 일부" : ""}</p>
+      <pre class="run-full">${escapeHtml(row.output || "(저장된 출력 없음)")}</pre>
+    </div>`).join("")}
+  </details>`;
+}
+
 function resultHtml(jobId, r) {
   const st = runStatus(r);
   const label = STATUS_LABEL[st] || st;
@@ -987,6 +1026,7 @@ function resultHtml(jobId, r) {
   return `<details class="run-result" data-result="${jobId}"${open}>
     <summary><span class="${statusClass(st)}">${label}</span> ${Math.round(r.seconds || 0)}s${model ? " · " + escapeHtml(model) : ""}</summary>
     <pre class="run-full">${escapeHtml(body || "(출력 없음)")}</pre>
+    ${toolResultsHtml(r)}
   </details>`;
 }
 
@@ -1009,7 +1049,7 @@ function runRowHtml(r) {
       <span class="run-row__meta">${escapeHtml(fmtTime(r.at))} · <span class="${statusClass(st)}">${label}</span> · ${Math.round(r.seconds || 0)}s${model ? " · " + escapeHtml(model) : ""}</span>
       ${!open && head ? `<span class="run-row__out">${escapeHtml(head)}${String(body).length > 200 ? "…" : ""}</span>` : ""}
     </button>
-    ${open ? `<pre class="run-full">${escapeHtml(body || "(출력 없음)")}</pre>` : ""}
+    ${open ? `<pre class="run-full">${escapeHtml(body || "(출력 없음)")}</pre>${toolResultsHtml(r)}` : ""}
   </div>`;
 }
 
@@ -1163,6 +1203,12 @@ jobList.addEventListener("click", async (ev) => {
 });
 
 jobList.addEventListener("toggle", (ev) => {
+  const evidence = ev.target.closest("details[data-evidence]");
+  if (evidence) {
+    if (evidence.open) openEvidence.add(evidence.dataset.evidence);
+    else openEvidence.delete(evidence.dataset.evidence);
+    return;
+  }
   const det = ev.target.closest("details[data-result]");
   if (!det) return;
   if (det.open) collapsedResults.delete(det.dataset.result);
@@ -1204,7 +1250,6 @@ function fillEdit(job) {
     mountModelDrop(job.model, missing);
     if (missing) showEditError(`저장된 모델 '${job.model}'이 지금은 설치되어 있지 않습니다. 설치에서 받거나 다른 모델을 고르세요.`);
   }
-  DD.setValue("jobProviderDrop", (job && job.provider) || "ollama");
   DD.setValue("jobAgentDrop", (job && job.agent) || "chat");
   if (job) setEffortValue(job.effort || "medium");
   else setEffortValue(effortForModel(DD.value("jobModelDrop")));
@@ -1235,7 +1280,7 @@ function formPayload(extra) {
   return {
     title: document.getElementById("title").value,
     prompt: document.getElementById("prompt").value,
-    provider: DD.value("jobProviderDrop") || "ollama",
+    provider: "ollama",
     model: DD.value("jobModelDrop"),
     agent: DD.value("jobAgentDrop") || "chat",
     tools: DD.selected("jobToolsDrop"),
@@ -1244,6 +1289,7 @@ function formPayload(extra) {
     time: document.getElementById("whenTime").value,
     alert: DD.value("alertDrop"),
     effort: effortValue(),
+    num_ctx: editNumCtx,
     permission: DD.value("permissionDrop"),
     cron: (document.getElementById("cronExpr") || {}).value || "",
     ram_policy: DD.value("ramPolicyDrop") || "defer",
@@ -1336,6 +1382,7 @@ function paintCron(data) {
 async function showSettings(status) {
   const alerts = (status && status.alerts) || {};
   document.getElementById("alertMacos").checked = alerts.macos !== false;
+  document.getElementById("alertMode").value = ["notification", "dialog", "window"].includes(alerts.macos_mode) ? alerts.macos_mode : "notification";
   document.getElementById("alertSound").checked = alerts.sound !== false;
   document.getElementById("alertWebhook").value = alerts.webhook || "";
   document.getElementById("alertResult").textContent = "";
@@ -1351,6 +1398,7 @@ async function showSettings(status) {
 function alertsPayload() {
   return {
     macos: document.getElementById("alertMacos").checked,
+    macos_mode: document.getElementById("alertMode").value,
     sound: document.getElementById("alertSound").checked,
     webhook: document.getElementById("alertWebhook").value.trim(),
   };
@@ -1362,7 +1410,9 @@ function alertResultLine(r) {
   const bits = [];
   const m = r.macos;
   if (!m) bits.push("macOS 꺼짐");
-  else if (m.ok) bits.push("macOS ✓");
+  else if (m.ok && m.mode === "window") bits.push("브라우저에 저장 결과 열기 요청 완료");
+  else if (m.ok && m.mode === "dialog") bits.push(m.acknowledged ? "확인 창 · 확인 누름" : "확인 창 · 45초 후 닫힘 (확인 안 됨)");
+  else if (m.ok) bits.push("macOS 전달 요청 완료 · 실제 표시는 시스템 설정에 따름");
   else bits.push(`macOS ✗ ${m.stderr || (m.code != null ? "code " + m.code : "")}`.trim());
   const w = r.webhook;
   if (!w) bits.push("웹훅 없음");

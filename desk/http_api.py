@@ -26,7 +26,7 @@ from typing import Any, Callable, Mapping
 from desk import catalog, crontab_sync, installer, jobs as jobs_mod, links, ollama_ctl, runner
 from desk.hardware import detect
 from desk.paths import DATA, STATIC
-from desk.state import load_config, locked, save_config
+from desk.state import MACOS_ALERT_MODES, load_config, locked, save_config
 
 HOST = "127.0.0.1"
 PORT = 8788
@@ -159,30 +159,36 @@ class Handler(BaseHTTPRequestHandler):
     def _sse(self, factory: Callable[[dict[str, Any]], Any], body: dict[str, Any]) -> None:
         if not _install_lock.acquire(blocking=False):
             return self._json(409, {"error": "이미 진행 중"})
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        self.wfile.write(b": connected\n\n")
-        self.wfile.flush()
+        events = None
         try:
-            for ev in factory(body):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            events = iter(factory(body))
+            for ev in events:
                 if installer.cancelled() and ev.get("event") != "done":
                     ev = {"event": "done", "ok": False, "cancelled": True, "error": "취소했습니다."}
                 self._event(ev)
                 if ev.get("event") == "done":
                     break
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             installer.request_cancel()
         except Exception as exc:
             try:
                 self._event({"event": "done", "ok": False, "error": str(exc), "trace": traceback.format_exc()})
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 installer.request_cancel()
         finally:
-            _install_lock.release()
+            try:
+                if events is not None and hasattr(events, "close"):
+                    events.close()
+            finally:
+                _install_lock.release()
 
     def _event(self, ev: dict[str, Any]) -> None:
         self.wfile.write(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8"))
@@ -336,9 +342,9 @@ def _status_route(req: Request) -> Result:
 
 def _status() -> dict[str, Any]:
     cfg = load_config()
-    up = ollama_ctl.running()
-    live = ollama_ctl.list_models() if up else []
-    if live:
+    live = ollama_ctl.model_inventory()
+    up = live is not None
+    if live is not None:
         names = [n for n in ((m.get("name") or m.get("model") or "") for m in live) if n]
         if sorted(names) != sorted(ollama_ctl.remembered_models()):
             ollama_ctl.remember_models(names)
@@ -446,6 +452,15 @@ def _runs(req: Request) -> Result:
     job_id = req.q("job").strip() or None
     limit = _int_query(req.q("limit"), 40, RUNS_LIMIT)
     return 200, {"runs": runner.list_runs(job_id, limit)}
+
+
+@route("POST", r"/api/runs/(?P<id>[^/]+)/open")
+def _runs_open(req: Request) -> Result:
+    """Open a persisted result without fetching data, running a job, or changing alert settings."""
+    run_id = req.params["id"]
+    if runner.get_run(run_id) is None:
+        raise KeyError(run_id)
+    return 200, _alerts()._macos_window(run_id)
 
 
 @route("GET", r"/api/crontab")
@@ -619,12 +634,16 @@ def _clean_webhook(raw: Any) -> str:
 @route("POST", r"/api/alerts")
 def _alerts_save(req: Request) -> Result:
     body = req.body
+    if "macos_mode" in body and body["macos_mode"] not in MACOS_ALERT_MODES:
+        raise ValueError("macOS 알림 방식은 notification, dialog 또는 window여야 합니다.")
     with locked():
         cfg = load_config()
         alerts = cfg["alerts"]
         for key in ("macos", "sound"):
             if key in body:
                 alerts[key] = bool(body[key])
+        if "macos_mode" in body:
+            alerts["macos_mode"] = body["macos_mode"]
         if "webhook" in body:
             alerts["webhook"] = _clean_webhook(body["webhook"])
         save_config(cfg)
@@ -661,6 +680,7 @@ def _models_remove(req: Request) -> Result:
 
 
 def serve(open_browser: bool = True) -> None:
+    from desk import oneshot
     from desk.paths import ensure_dirs
 
     ensure_dirs()
@@ -671,8 +691,11 @@ def serve(open_browser: bool = True) -> None:
         import webbrowser
 
         webbrowser.open(url)
+    oneshot.start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstop", flush=True)
+    finally:
+        oneshot.stop()
         httpd.server_close()

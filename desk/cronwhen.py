@@ -6,9 +6,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
-SEOUL = ZoneInfo("Asia/Seoul")
 
 FieldSets = tuple[set[int], set[int], set[int], set[int], set[int]]
 
@@ -30,20 +27,23 @@ def is_valid(expr: str) -> bool:
 
 
 def next_runs(expr: str, start: datetime, count: int = 50, horizon: datetime | None = None) -> list[datetime]:
-    """``start`` 이후(초과) 실행 시각들. 반환값은 Asia/Seoul tz-aware. 최대 366일 탐색."""
+    """``start`` 이후(초과) 실행 시각들. 시스템 cron과 같은 로컬 시간대의 tz-aware 값을 반환한다. 최대 366일 탐색."""
     parsed = _parse_fields(expr)
     if not parsed or count <= 0:
         return []
     (minutes, hours, doms, months, dows), dom_star, dow_star = parsed
-    start = _to_seoul(start).replace(second=0, microsecond=0)
-    limit = _to_seoul(horizon) if horizon else None
+    start = _to_local(start).replace(second=0, microsecond=0)
+    limit = _to_local(horizon) if horizon else None
     out: list[datetime] = []
     day = start.date()
     for _ in range(_MAX_DAYS + 1):
         if day.month in months and _day_matches(day, doms, dows, dom_star, dow_star):
             for hour in sorted(hours):
                 for minute in sorted(minutes):
-                    when = datetime(day.year, day.month, day.day, hour, minute, tzinfo=SEOUL)
+                    wall = datetime(day.year, day.month, day.day, hour, minute)
+                    when = _to_local(wall)
+                    if when.replace(tzinfo=None) != wall:
+                        continue  # DST 전환으로 존재하지 않는 현지 시각
                     if when <= start:
                         continue
                     if limit and when > limit:
@@ -162,10 +162,10 @@ def _day_matches(day, doms: set[int], dows: set[int], dom_star: bool, dow_star: 
     return dom_ok or dow_ok
 
 
-def _to_seoul(when: datetime) -> datetime:
-    if when.tzinfo is None:
-        return when.replace(tzinfo=SEOUL)
-    return when.astimezone(SEOUL)
+def _to_local(when: datetime) -> datetime:
+    # Resolve each date through the OS so future dates use their own DST offset.
+    # A naive datetime is a local wall time, as it is for the system cron daemon.
+    return when.astimezone()
 
 
 def _step_of(field: str, span: int) -> int | None:

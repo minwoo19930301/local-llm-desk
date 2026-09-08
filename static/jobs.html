@@ -152,6 +152,19 @@
           </div>
         </div>
         <div id="permissionDrop"></div>
+        <details class="execution-options">
+          <summary>실행 시간과 메모리 설정</summary>
+          <div class="stack">
+            <label for="maxMinutes">최대 실행 시간 (분)</label>
+            <input id="maxMinutes" class="gds-text-field__input" type="number" min="1" max="720" value="30" />
+            <div id="ramPolicyDrop"></div>
+            <div id="deferWrap" class="stack">
+              <label for="deferMax">메모리가 부족하면 기다릴 시간 (분)</label>
+              <input id="deferMax" class="gds-text-field__input" type="number" min="1" max="720" value="30" />
+            </div>
+            <div id="fallbackWrap" hidden><div id="fallbackModelDrop"></div></div>
+          </div>
+        </details>
         <div id="presetDrop"></div>
         <div class="when" id="whenWrap" hidden>
           <div class="gds-text-field gds-text-field--small" id="timeWrap">
@@ -198,7 +211,14 @@
       <div class="settings">
         <h2 class="sec-title">알림</h2>
         <label class="switch"><input type="checkbox" id="alertMacos" /> macOS 알림</label>
-        <label class="switch"><input type="checkbox" id="alertSound" /> 알림 소리</label>
+        <label for="alertMode">완료 알림 방식</label>
+        <select id="alertMode" class="gds-text-field__input">
+          <option value="notification">macOS 알림 배너</option>
+          <option value="dialog">45초 결과 확인 창</option>
+          <option value="window">브라우저에서 결과 열기</option>
+        </select>
+        <p class="legend legend--left">배너가 보이지 않으면 결과 창을 사용하세요. 확인 창은 45초 뒤 닫히고, 브라우저 결과는 닫을 때까지 남습니다.</p>
+        <label class="switch"><input type="checkbox" id="alertSound" /> 배너·확인 창 소리</label>
         <div class="gds-text-field gds-text-field--small">
           <input id="alertWebhook" class="gds-text-field__input" placeholder="웹훅 URL (없어도 됨)" aria-label="웹훅 URL" />
         </div>

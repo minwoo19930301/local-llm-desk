@@ -8,13 +8,15 @@ is never touched.
 from __future__ import annotations
 
 import subprocess
+import shlex
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from desk import crontab_sync, http_api, jobs, state
+from desk import connectors, crontab_sync, http_api, jobs, state
 
 
 class TempData(unittest.TestCase):
@@ -24,6 +26,8 @@ class TempData(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
         self.patches = [
+            mock.patch.object(state, "ensure_dirs"),
+            mock.patch.object(connectors, "load", return_value=[{"id": "c1"}]),
             mock.patch.object(state, "JOBS_FILE", base / "jobs.json"),
             mock.patch.object(state, "CONFIG_FILE", base / "config.json"),
             mock.patch.object(state, "LOCK_FILE", base / ".lock"),
@@ -66,7 +70,13 @@ class NormalizeKnobs(unittest.TestCase):
         self.assertEqual(jobs.normalize_knobs({"max_loops": 999})["max_loops"], 32)
 
     def test_connectors_dedupe(self) -> None:
-        self.assertEqual(jobs.normalize_knobs({"connectors": ["a", " a ", "b", ""]})["connectors"], ["a", "b"])
+        with mock.patch.object(connectors, "load", return_value=[{"id": "a"}, {"id": "b"}]):
+            self.assertEqual(jobs.normalize_knobs({"connectors": ["a", " a ", "b", ""]})["connectors"], ["a", "b"])
+
+    def test_unknown_connector_is_rejected(self) -> None:
+        with mock.patch.object(connectors, "load", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "등록되지 않은 연동"):
+                jobs.normalize_knobs({"connectors": ["missing"]})
 
 
 class CreateUpdate(TempData):
@@ -105,6 +115,46 @@ class CreateUpdate(TempData):
         with mock.patch.object(jobs, "_now", return_value=jobs._now().replace(year=2031)):
             same = jobs.update_job(job["id"], {"title": "new", "preset": "once_1m", "time": "17:00", "repeat": "daily"})["job"]
         self.assertEqual(same["cron"], cron)
+
+    def test_five_minute_once_never_fires_early_and_crosses_year_boundary(self) -> None:
+        now = datetime(2026, 12, 31, 23, 57, 42, tzinfo=timezone.utc)
+        with mock.patch.object(jobs, "_now", return_value=now):
+            job = self._create(preset="once_5m")
+        self.assertTrue(job["once"])
+        self.assertEqual(job["cron"], "")
+        self.assertEqual(job["schedule_backend"], "desk")
+        self.assertEqual(job["once_at"], "2027-01-01T00:02:42+00:00")
+        delay = datetime.fromisoformat(job["once_at"]) - now
+        self.assertEqual(delay, timedelta(minutes=5))
+
+    def test_five_minute_once_on_minute_boundary_is_exact(self) -> None:
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        with mock.patch.object(jobs, "_now", return_value=now):
+            job = self._create(preset="once_5m")
+            self.assertEqual(jobs.resolve_schedule("once_5m"), ("", True))
+        self.assertEqual(job["once_at"], "2026-09-08T12:05:00+00:00")
+
+    def test_five_minute_once_edits_and_toggle_do_not_rearm(self) -> None:
+        job = self._create(preset="once_5m")
+        updated = jobs.update_job(job["id"], {"preset": "once_5m", "title": "changed"})["job"]
+        self.assertEqual(updated["cron"], job["cron"])
+        self.assertEqual(updated["once_at"], job["once_at"])
+        jobs.disable_if_once(job["id"])
+        fired = jobs.get_job(job["id"])
+        self.assertFalse(fired["enabled"])
+        self.assertEqual(fired["cron"], "")
+        self.assertIn("fired_at", fired)
+        updated = jobs.update_job(job["id"], {"preset": "once_5m", "title": "edited after completion", "enabled": True})["job"]
+        self.assertEqual(updated["cron"], "")
+        self.assertEqual(updated["once_at"], job["once_at"])
+        self.assertIsNone(updated["next_run"])
+
+    def test_one_minute_once_retains_original_timing(self) -> None:
+        now = datetime(2026, 9, 8, 12, 0, 42, tzinfo=timezone.utc)
+        with mock.patch.object(jobs, "_now", return_value=now):
+            job = self._create(preset="once_1m")
+        self.assertEqual(job["cron"], "1 12 8 9 *")
+        self.assertEqual(job["once_at"], "2026-09-08T12:01:42+00:00")
 
     def test_fired_once_label_and_reschedule(self) -> None:
         job = jobs.create_job({"prompt": "x", "model": "m", "preset": "once_1m"})["job"]
@@ -147,7 +197,7 @@ class Locking(TempData):
         with state.locked():
             with state.locked():
                 state.save_config(state.load_config())
-        self.assertEqual(state.load_config()["alerts"], {"macos": True, "sound": True, "webhook": ""})
+            self.assertEqual(state.load_config()["alerts"], {"macos": True, "macos_mode": "notification", "sound": True, "webhook": ""})
 
 
 class Crontab(unittest.TestCase):
@@ -183,6 +233,17 @@ class Crontab(unittest.TestCase):
         self.assertIn("# 50 off", new)
         self.assertNotIn("%", new.split(crontab_sync.BEGIN)[1])
         self.assertEqual(crontab_sync.compose(existing, []), "0 1 * * * echo hi\n")
+
+    def test_command_preserves_paths_with_spaces_quotes_and_percent(self) -> None:
+        wrapper = Path("/tmp/Team's 50% projects/desk/cron_wrap.sh")
+        python = "/tmp/Python 3/bin/python"
+        with mock.patch.object(crontab_sync, "CRON_WRAP", wrapper), mock.patch.object(crontab_sync.sys, "executable", python):
+            block = crontab_sync.managed_block([{"id": "abc", "enabled": True, "cron": "0 9 * * *"}])
+        command = next(line for line in block.splitlines() if line.startswith("0 9 ")).split(maxsplit=5)[5]
+        self.assertIn(r"\%", command)
+        # cron removes the escape before passing the command to its shell.
+        argv = shlex.split(command.replace(r"\%", "%"), comments=True)
+        self.assertEqual(argv, [f"DESK_PYTHON={python}", str(wrapper), "abc"])
 
     def test_invalid_cron_skipped(self) -> None:
         block = crontab_sync.managed_block([{"id": "j", "enabled": True, "cron": "99 99 * * *", "title": "t"}])

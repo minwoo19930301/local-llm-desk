@@ -22,7 +22,9 @@ PRESETS = {
     "hourly": "0 * * * *",
     "every_6h": "0 */6 * * *",
     "once_1m": "once_1m",
+    "once_5m": "once_5m",
 }
+ONCE_DELAYS = {"once_1m": 1, "once_5m": 5}
 WHEN_PRESETS = ("daily", "weekdays", "weekend", "custom")
 TOOL_KINDS = ("cli", "http", "chrome", "mcp")
 
@@ -209,7 +211,7 @@ def create_job(payload: dict[str, Any]) -> dict[str, Any]:
         data = load_jobs()
         data["jobs"].append(job)
         save_jobs(data)
-        sync = crontab_sync.apply(data["jobs"])
+        sync = _sync_change(data["jobs"], None, job)
     return {"job": with_schedule(job), "crontab": sync}
 
 
@@ -219,10 +221,45 @@ def update_job(job_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         found = next((j for j in data["jobs"] if j.get("id") == job_id), None)
         if not found:
             raise KeyError(job_id)
+        before = dict(found)
         _apply_patch(found, patch)
         save_jobs(data)
-        sync = crontab_sync.apply(data["jobs"])
+        sync = _sync_change(data["jobs"], before, found)
     return {"job": with_schedule(found), "crontab": sync}
+
+
+def _sync_change(all_jobs: list[dict], before: dict | None, after: dict | None) -> dict:
+    changed = [job for job in (before, after) if job]
+    if changed and all(job.get("schedule_backend") == "desk" for job in changed):
+        from desk import oneshot
+        job = after or before or {}
+        return {"ok": True, "backend": "desk", "registered": bool(after and job.get("enabled") and not job.get("once_claimed_at") and not job.get("fired_at")),
+                "running": oneshot.running(), "due_at": job.get("due_at"), "cron_changed": False}
+    return crontab_sync.apply(all_jobs)
+
+
+def claim_desk_once(job_id: str, *, allow_early: bool = False) -> tuple[dict | None, str | None]:
+    """Claim a persisted app timer once. Caller holds the per-job execution lock."""
+    with locked():
+        data = load_jobs()
+        job = next((item for item in data["jobs"] if item.get("id") == job_id), None)
+        if job is None:
+            return None, "삭제된 자동화"
+        if job.get("schedule_backend") != "desk":
+            return None, "일정이 변경된 자동화"
+        if not job.get("enabled") or job.get("once_claimed_at") or job.get("fired_at"):
+            return None, "이미 실행했거나 비활성화된 자동화"
+        due = _parse_iso(job.get("due_at") or job.get("once_at"))
+        if due is None:
+            return None, "예약 시각이 없는 자동화"
+        if due.tzinfo is None:
+            due = due.astimezone()
+        now = _now()
+        if not allow_early and due > now:
+            return None, "아직 예약 시각 전입니다"
+        job["once_claimed_at"] = now.isoformat(timespec="seconds")
+        save_jobs(data)
+        return dict(job), None
 
 
 def _apply_patch(found: dict[str, Any], patch: dict[str, Any]) -> None:
@@ -252,7 +289,7 @@ def _apply_patch(found: dict[str, Any], patch: dict[str, Any]) -> None:
 
 
 def _apply_schedule_patch(found: dict[str, Any], patch: dict[str, Any]) -> None:
-    """Re-resolve the schedule only when it really changed (never re-arm once_1m on unrelated edits)."""
+    """Re-resolve the schedule only when it really changed (never re-arm one-shot jobs on unrelated edits)."""
     preset = patch.get("preset", found.get("preset") or "custom")
     if not _schedule_changed(found, patch, preset):
         return
@@ -262,6 +299,7 @@ def _apply_schedule_patch(found: dict[str, Any], patch: dict[str, Any]) -> None:
     if "time" in patch:
         found["time"] = patch.get("time") or "17:00"
     found.update(_schedule_fields(preset, {**found, **patch}))
+    found.pop("once_claimed_at", None)
     if found.pop("fired_at", None) and "enabled" not in patch:
         found["enabled"] = True
 
@@ -284,9 +322,10 @@ def _schedule_changed(found: dict[str, Any], patch: dict[str, Any], preset: str)
 def delete_job(job_id: str) -> dict[str, Any]:
     with locked():
         data = load_jobs()
+        before = next((j for j in data["jobs"] if j.get("id") == job_id), None)
         data["jobs"] = [j for j in data["jobs"] if j.get("id") != job_id]
         save_jobs(data)
-        sync = crontab_sync.apply(data["jobs"])
+        sync = _sync_change(data["jobs"], before, None)
     return {"ok": True, "crontab": sync}
 
 
@@ -315,7 +354,8 @@ def disable_if_once(job_id: str) -> dict[str, Any] | None:
     with locked():
         if not _patch_job(job_id, mutate):
             return None
-        return crontab_sync.apply(list_jobs())
+        current = get_job(job_id)
+        return _sync_change(list_jobs(), current, current)
 
 
 def mark_last_run(job_id: str, run: dict[str, Any]) -> None:
@@ -327,9 +367,22 @@ def mark_last_run(job_id: str, run: dict[str, Any]) -> None:
 
 
 def _schedule_fields(preset: str, body: dict[str, Any]) -> dict[str, Any]:
+    if preset in ONCE_DELAYS:
+        when = _once_when(preset)
+        desk = preset == "once_5m"
+        due = when.isoformat(timespec="seconds")
+        return {"cron": "" if desk else _once_cron(when), "once": True, "once_at": due,
+                "due_at": due if desk else None, "schedule_backend": "desk" if desk else "cron"}
     cron, once = resolve_schedule(preset, body)
-    once_at = (_now() + timedelta(minutes=1)).isoformat(timespec="seconds") if once else None
-    return {"cron": cron, "once": once, "once_at": once_at}
+    return {"cron": cron, "once": once, "once_at": None, "due_at": None, "schedule_backend": "cron"}
+
+
+def _once_when(preset: str) -> datetime:
+    return _now() + timedelta(minutes=ONCE_DELAYS[preset])
+
+
+def _once_cron(when: datetime) -> str:
+    return f"{when.minute} {when.hour} {when.day} {when.month} *"
 
 
 def resolve_schedule(preset: str, payload: dict[str, Any] | str | None = None) -> tuple[str, bool]:
@@ -342,9 +395,8 @@ def resolve_schedule(preset: str, payload: dict[str, Any] | str | None = None) -
         cron = (payload or "").strip()
     if preset in ("save", "now"):
         return "", False
-    if preset == "once_1m":
-        when = _now() + timedelta(minutes=1)
-        return f"{when.minute} {when.hour} {when.day} {when.month} *", True
+    if preset in ONCE_DELAYS:
+        return ("" if preset == "once_5m" else _once_cron(_once_when(preset))), True
     if preset in WHEN_PRESETS:
         if preset == "custom" and cron:
             if not _valid_cron(cron):
@@ -400,10 +452,10 @@ def schedule_label(job: dict[str, Any]) -> str:
     """Korean summary of when the job runs, e.g. '매일 17:00', '한 번 실행함', '예약 없음'."""
     cron = (job.get("cron") or "").strip()
     if job.get("once"):
-        if not job.get("enabled") or not cron:
+        if not job.get("enabled") or job.get("fired_at") or (not cron and job.get("schedule_backend") != "desk"):
             return "한 번 실행함"
         when = _parse_iso(job.get("once_at"))
-        return f"{when.month}/{when.day} {when:%H:%M} 한 번" if when else "1분 뒤 한 번"
+        return f"{when.month}/{when.day} {when:%H:%M} 한 번" if when else f"{ONCE_DELAYS.get(job.get('preset'), 1)}분 뒤 한 번"
     if not cron:
         return "예약 없음"
     try:
@@ -416,7 +468,13 @@ def schedule_label(job: dict[str, Any]) -> str:
 def next_run(job: dict[str, Any], start: datetime | None = None) -> datetime | None:
     """Next scheduled time for an enabled job with a cron line, else None."""
     cron = (job.get("cron") or "").strip()
-    if not job.get("enabled") or not cron:
+    if not job.get("enabled"):
+        return None
+    if job.get("schedule_backend") == "desk":
+        if job.get("once_claimed_at") or job.get("fired_at"):
+            return None
+        return _parse_iso(job.get("due_at") or job.get("once_at"))
+    if not cron:
         return None
     try:
         from desk import cronwhen

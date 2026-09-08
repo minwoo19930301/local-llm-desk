@@ -1104,3 +1104,8 @@ body.is-wide .gds-heading__title { text-align: left; }
   .policy { grid-template-columns: 1fr; }
   .job .row .gds-button { flex: 1 1 auto; }
 }
+/* Secondary execution controls keep the primary job form compact. */
+.execution-options { width: 100%; text-align: left; }
+.execution-options > summary { cursor: pointer; padding: 12px 0; }
+.execution-options[open] > .stack { padding: 12px 0; }
+.execution-options [hidden] { display: none !important; }

@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import socket
+import threading
 import shutil
 import signal
 import subprocess
@@ -14,18 +17,21 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from desk import state
 from desk.paths import LOGS_DIR, PID_DIR
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
 PID_FILE = PID_DIR / "ollama.json"
+SESSIONS_FILE = PID_DIR / "ollama-sessions.json"
 SERVE_LOG = LOGS_DIR / "ollama-serve.log"
 KEEP_ALIVE = "2m"
 SERVE_ENV = {
+    "OLLAMA_HOST": "127.0.0.1:11434",
     "OLLAMA_KEEP_ALIVE": KEEP_ALIVE,
     "OLLAMA_MAX_LOADED_MODELS": "1",
     "OLLAMA_NUM_PARALLEL": "1",
@@ -83,7 +89,7 @@ def app_installed() -> bool:
 def binary() -> str | None:
     found = shutil.which("ollama")
     if found and Path(found).is_file():
-        return found
+        return str(Path(found).resolve())
     cands: list[Path] = []
     if sys.platform == "win32":
         cands.append(PathApp())
@@ -95,7 +101,7 @@ def binary() -> str | None:
     for path in cands:
         try:
             if path.is_file() and os.access(path, os.X_OK):
-                return str(path)
+                return str(path.resolve())
         except OSError:
             continue
     return None
@@ -108,7 +114,8 @@ def start() -> bool:
     """헤드리스 서버를 띄운다. 이미 떠 있으면 False(남의 서버), 우리가 띄웠으면 True."""
     global _proc
     with state.locked():
-        if running():
+        # Another process may have spawned the server before its HTTP socket is ready.
+        if _owned_alive() or running():
             return False
         exe = binary()
         if not exe:
@@ -123,13 +130,26 @@ def start() -> bool:
                 env={**os.environ, **SERVE_ENV},
             )
         _proc = proc
-        _write_record(proc.pid, exe)
+        try:
+            _write_record(proc.pid, exe)
+        except BaseException:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            _proc = None
+            raise
     return True
 
 
 def _write_record(pid: int, exe: str, refs: int = 0) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
-    record = {"pid": pid, "lstart": _ps_lstart(pid), "exe": exe, "started_at": time.time(), "refs": refs}
+    stamp = _ps_lstart(pid)
+    if not stamp:
+        raise RuntimeError("Ollama 프로세스 소유권을 확인하지 못했습니다.")
+    record = {"pid": pid, "lstart": stamp, "exe": exe, "started_at": time.time(), "refs": refs}
     PID_FILE.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
 
@@ -150,28 +170,28 @@ def _clear_record() -> None:
 
 def _ps_lstart(pid: int) -> str:
     try:
-        return subprocess.check_output(["ps", "-o", "lstart=", "-p", str(pid)], text=True, timeout=5).strip()
+        return " ".join(subprocess.check_output(["ps", "-o", "lstart=", "-p", str(pid)], text=True, timeout=5).split())
     except (subprocess.SubprocessError, OSError):
         return ""
 
 
 def _verify_record(record: dict[str, Any]) -> bool:
     """pid가 살아 있고 '우리 바이너리 serve, 같은 시작 시각, 세션 리더'인지 ps로 재확인."""
-    pid = int(record["pid"])
     try:
+        pid = int(record["pid"])
+        if pid <= 1:
+            return False
         out = subprocess.check_output(["ps", "-o", "lstart=,pgid=,ppid=,args=", "-p", str(pid)], text=True, timeout=5).strip()
-    except (subprocess.SubprocessError, OSError, ValueError):
+    except (subprocess.SubprocessError, OSError, ValueError, TypeError, KeyError):
         return False
-    fields = out.split()
-    if len(fields) < 8:
+    # Keep the command intact: application paths can contain spaces.
+    fields = out.split(maxsplit=7)
+    if len(fields) != 8:
         return False
     lstart = " ".join(fields[:5])
-    pgid, args = fields[5], " ".join(fields[7:])
-    if record.get("lstart") and lstart != str(record["lstart"]).strip():
-        return False
-    if pgid != str(pid):
-        return False
-    return args.startswith(str(record.get("exe") or "")) and " serve" in args
+    stamp = " ".join(str(record.get("lstart") or "").split())
+    exe = str(record.get("exe") or "")
+    return bool(stamp and exe) and lstart == stamp and fields[5] == str(pid) and fields[7] == exe + " serve"
 
 
 def _owned_alive() -> bool:
@@ -185,53 +205,87 @@ def _owned_alive() -> bool:
 
 
 def stop() -> bool:
-    """우리가 띄운 서버만 끈다. 기록이 없거나 재검증에 실패하면 아무것도 죽이지 않는다."""
-    global _proc
+    """Stop only a verified Desk server with no active sessions."""
     with state.locked():
-        record = _read_record()
-        if not record or not _verify_record(record):
-            _clear_record()
+        if _live_sessions():
             return False
-        pid = int(record["pid"])
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            _clear_record()
-            return False
-        deadline = time.time() + 8
-        while time.time() < deadline and _alive(pid):
-            time.sleep(0.2)
-        if _alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        if _proc is not None and _proc.pid == pid:
-            try:
-                _proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            _proc = None
+        return _stop_owned()
+
+
+def _stop_owned() -> bool:
+    """Caller holds state.locked() and has already established there are no users."""
+    global _proc
+    record = _read_record()
+    if not record or not _verify_record(record):
         _clear_record()
+        return False
+    pid = int(record["pid"])
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _clear_record()
+        return False
+    deadline = time.time() + 8
+    while time.time() < deadline and _alive(pid):
+        time.sleep(0.2)
+    if _alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if _proc is not None and _proc.pid == pid:
+        try:
+            _proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        _proc = None
+    _clear_record()
     return True
 
-
-def _adjust_refs(delta: int) -> int:
-    """PID 기록의 활성 세션 카운터를 잠금 하에 증감한다. 기록이 없으면 0을 반환한다."""
-    with state.locked():
-        record = _read_record()
-        if not record:
-            return 0
-        refs = max(0, int(record.get("refs") or 0) + delta)
-        record["refs"] = refs
+def _live_sessions() -> dict[str, Any]:
+    """Read leases under state.locked(); discard clients that exited or reused a PID."""
+    leases = state.read_json(SESSIONS_FILE, {})
+    if not isinstance(leases, dict):
+        return {}
+    live = {}
+    server = _server_key()
+    for token, lease in leases.items():
         try:
-            PID_FILE.write_text(json.dumps(record) + "\n", encoding="utf-8")
-        except OSError:
-            pass
-        return refs
+            pid = int(lease["pid"])
+            stamp = str(lease["lstart"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lease.get("server") and lease["server"] != server:
+            continue
+        if stamp and _ps_lstart(pid) == stamp:
+            live[token] = lease
+    return live
+
+
+def _server_key() -> str:
+    record = _read_record()
+    if not record:
+        return ""
+    return f"{record['pid']}:{record.get('lstart')}:{record.get('started_at')}"
+
+
+def _save_sessions(leases: dict[str, Any]) -> None:
+    PID_DIR.mkdir(parents=True, exist_ok=True)
+    state.write_json(SESSIONS_FILE, leases)
+    record = _read_record()
+    if record:
+        record["refs"] = len(leases)
+        state.write_json(PID_FILE, record)
+
+
+def _model_key(model: str | None) -> str:
+    name = model or ""
+    return name if not name or ":" in name.rsplit("/", 1)[-1] else name + ":latest"
 
 
 def _alive(pid: int) -> bool:
+    if _proc is not None and _proc.pid == pid and _proc.poll() is not None:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -274,31 +328,59 @@ def show_model(model: str) -> dict[str, Any]:
 
 
 @contextmanager
-def session(model: str | None = None) -> Iterator[None]:
-    """실행용 세션. 동시에 여러 잡이 세션을 열 수 있으므로 참조 카운트로 소유권을 추적하고,
-    카운트가 0이 되고 로드된 모델도 없을 때만 우리가 띄운 서버를 끈다."""
-    ours = start() or _owned_alive()
-    if ours:
-        _adjust_refs(1)
-    if not wait_until_up(40):
-        if ours:
-            _adjust_refs(-1)
-        raise RuntimeError("Ollama가 꺼져 있고 기동도 실패했습니다.")
+def session(model: str | None = None, *, cancel: Callable[[], bool] | None = None) -> Iterator[None]:
+    """Acquire a cross-process lease, then release/unload only after the last user.
+
+    Startup and lease acquisition share the same lock as shutdown. HTTP readiness
+    is awaited outside it, so concurrent jobs can share a starting server.
+    """
+    token = uuid.uuid4().hex
+    ours = False
+    with state.locked():
+        start()
+        ours = _owned_alive()
+        leases = _live_sessions()
+        stamp = _ps_lstart(os.getpid())
+        if not stamp:
+            if ours and not leases:
+                stop()
+            raise RuntimeError("실행 세션의 프로세스를 확인하지 못했습니다.")
+        leases[token] = {"pid": os.getpid(), "lstart": stamp, "model": _model_key(model), "server": _server_key() if ours else ""}
+        try:
+            _save_sessions(leases)
+        except BaseException:
+            leases.pop(token, None)
+            try:
+                _save_sessions(leases)
+            finally:
+                if ours and not leases:
+                    _stop_owned()
+            raise
     try:
+        if not wait_until_up(40, cancel=cancel):
+            raise RuntimeError("Ollama가 꺼져 있고 기동도 실패했습니다.")
+        if cancel and cancel():
+            raise RuntimeError("취소했습니다.")
         yield
     finally:
-        unloaded = unload(model) if model else True
-        if ours:
-            remaining = _adjust_refs(-1)
-            if remaining <= 0 and unloaded and not loaded_models():
-                stop()
+        with state.locked():
+            leases = _live_sessions()
+            leases.pop(token, None)
+            try:
+                _save_sessions(leases)
+            finally:
+                # A full disk must not prevent process cleanup after a pull.
+                # We hold the same lock as acquisition, so this lease snapshot
+                # remains authoritative even if persisting its removal failed.
+                if ours and not leases:
+                    _stop_owned()
+                elif model and not any(not lease.get("model") or lease["model"] == _model_key(model) for lease in leases.values()):
+                    unload(model)
 
 
 def ensure_background() -> None:
-    """설치 단계에서만 쓴다. 레거시 LaunchAgent가 있으면 치우고 서버를 띄운다."""
+    """Compatibility helper: remove Desk's obsolete auto-start agent only."""
     _remove_launch_agent()
-    start()
-    wait_until_up(20)
 
 
 def _remove_launch_agent() -> None:
@@ -308,16 +390,24 @@ def _remove_launch_agent() -> None:
     plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
     if not plist.exists():
         return
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True)
-    try:
-        plist.unlink()
-    except FileNotFoundError:
-        pass
+    target = f"gui/{os.getuid()}/{label}"
+    loaded = subprocess.run(["launchctl", "print", target], capture_output=True, timeout=10)
+    if loaded.returncode == 0:
+        removed = subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=10)
+        if removed.returncode != 0:
+            raise RuntimeError("기존 Desk Ollama 자동 실행을 해제하지 못했습니다.")
+    # Keep a reviewable backup outside LaunchAgents before removing its login trigger.
+    backups = PID_DIR.parent / "backups"
+    backups.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(plist, backups / f"{label}.{time.time_ns()}.plist")
+    plist.unlink()
 
 
-def wait_until_up(seconds: int = 40) -> bool:
+def wait_until_up(seconds: int = 40, *, cancel: Callable[[], bool] | None = None) -> bool:
     deadline = time.time() + seconds
     while time.time() < deadline:
+        if cancel and cancel():
+            raise RuntimeError("취소했습니다.")
         if running():
             return True
         time.sleep(0.5)
@@ -327,11 +417,16 @@ def wait_until_up(seconds: int = 40) -> bool:
 # --- 모델 목록 ---------------------------------------------------------------
 
 
+def model_inventory() -> list[dict[str, Any]] | None:
+    """Authoritative tags, including an empty list; None means unavailable. Never starts Ollama."""
+    try:
+        return list(_get("/api/tags", timeout=5.0).get("models") or [])
+    except Exception:
+        return None
+
+
 def list_models() -> list[dict[str, Any]]:
-    if not running():
-        return []
-    data = _get("/api/tags", timeout=5.0)
-    return data.get("models") or []
+    return model_inventory() or []
 
 
 def has_model(name: str) -> bool:
@@ -339,7 +434,10 @@ def has_model(name: str) -> bool:
 
 
 def default_model() -> str:
-    models = list_models()
+    models = model_inventory()
+    if models == []:
+        remember_models([])
+        return ""
     if models:
         models = sorted(models, key=lambda m: int(m.get("size") or 0))
         name = (models[0].get("name") or models[0].get("model") or "").strip()
@@ -362,10 +460,11 @@ def remembered_models() -> list[str]:
 def remember_models(names: list[str] | None = None) -> list[str]:
     """config.json의 models를 갱신한다. 값이 같으면 쓰지 않는다."""
     if names is None:
-        names = [(m.get("name") or m.get("model") or "") for m in list_models()]
+        live = model_inventory()
+        if live is None:
+            return remembered_models()
+        names = [(m.get("name") or m.get("model") or "") for m in live]
     names = [n for n in names if n]
-    if not names:
-        return remembered_models()
     try:
         from desk import state
 
@@ -374,6 +473,8 @@ def remember_models(names: list[str] | None = None) -> list[str]:
             cfg = state.load_config()
             if list(cfg.get("models") or []) != names:
                 cfg["models"] = names
+                if not names:
+                    cfg["setup_done"] = False
                 state.save_config(cfg)
     except Exception:
         pass
@@ -392,9 +493,7 @@ def _should_stop() -> bool:
 def _ensure_up(seconds: int) -> None:
     if running():
         return
-    start()
-    if not wait_until_up(seconds):
-        raise RuntimeError("Ollama가 안 떠 있습니다.")
+    raise RuntimeError("Ollama 실행 세션이 없습니다.")
 
 
 def remove_model(name: str) -> None:
@@ -409,33 +508,90 @@ def remove_model(name: str) -> None:
     _post("/api/delete", body, timeout=30)
 
 
+def _pull_lines(req: urllib.request.Request) -> Iterator[bytes]:
+    """Read downloads off the request thread so cancellation can close their socket."""
+    events: queue.Queue = queue.Queue(maxsize=32)
+    done = threading.Event()
+    holder: list[Any] = []
+
+    def publish(value: Any) -> None:
+        while not done.is_set():
+            try:
+                events.put(value, timeout=0.2)
+                return
+            except queue.Full:
+                pass
+
+    def read() -> None:
+        try:
+            # Bound connect/header waits too; body reads can be long and are
+            # interrupted through the response socket by the session owner.
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                holder.append(resp)
+                while not done.is_set():
+                    raw = resp.readline()
+                    if not raw:
+                        break
+                    publish(raw)
+        except Exception as exc:
+            publish(exc)
+        finally:
+            publish(None)
+
+    worker = threading.Thread(target=read, name="ollama-pull", daemon=True)
+    worker.start()
+    try:
+        while True:
+            if _should_stop():
+                raise RuntimeError("취소했습니다.")
+            try:
+                value = events.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if value is None:
+                break
+            if isinstance(value, Exception):
+                raise value
+            yield value
+    finally:
+        done.set()
+        if holder:
+            # urllib returns HTTPResponse; shutdown interrupts a blocked read
+            # without waiting on the buffered reader's close lock.
+            raw = getattr(getattr(holder[0], "fp", None), "raw", None)
+            sock = getattr(raw, "_sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        worker.join(timeout=1)
+
+
 def pull_model(name: str) -> Iterator[str]:
     _ensure_up(40)
     body = json.dumps({"name": name, "stream": True}).encode("utf-8")
     req = urllib.request.Request(OLLAMA_HOST + "/api/pull", data=body, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=3600) as resp:
-        while True:
-            if _should_stop():
-                yield "취소됨"
-                return
-            raw = resp.readline()
-            if not raw:
-                break
-            try:
-                data = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
-                continue
-            err = data.get("error")
-            if err:
-                raise RuntimeError(str(err))
-            status = str(data.get("status") or "")
-            total = data.get("total") or 0
-            done = data.get("completed") or 0
-            if total:
-                pct = min(100, int(100 * done / total))
-                yield f"{status} {pct}%".strip()
-            elif status:
-                yield status
+    success = False
+    for raw in _pull_lines(req):
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            continue
+        err = data.get("error")
+        if err:
+            raise RuntimeError(str(err))
+        status = str(data.get("status") or "")
+        success = success or status == "success"
+        total = data.get("total") or 0
+        completed = data.get("completed") or 0
+        if total:
+            pct = min(100, int(100 * completed / total))
+            yield f"{status} {pct}%".strip()
+        elif status:
+            yield status
+    if not success:
+        raise RuntimeError("모델 다운로드가 완료되기 전에 연결이 끊겼습니다.")
 
 
 # --- 채팅 -------------------------------------------------------------------

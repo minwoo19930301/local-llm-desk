@@ -6,18 +6,20 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
 import sys
 import re
+import tempfile
 from collections import Counter
 import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 # Allow `python3 desk/runner.py` from cron.
@@ -27,6 +29,7 @@ if str(ROOT) not in sys.path:
 
 from desk import alerts, jobs as jobs_mod, ollama_ctl, ramgate  # noqa: E402
 from desk.paths import DATA, LOGS_DIR, PID_DIR, RUNS_DIR, ensure_dirs  # noqa: E402
+from desk.state import locked, read_json, write_json  # noqa: E402
 
 SEOUL = ZoneInfo("Asia/Seoul")
 ACTIVE_FILE = RUNS_DIR / "active.json"
@@ -36,11 +39,13 @@ DEFAULT_DEFER_MIN = 30
 DEFER_POLL_S = 30
 ONCE_GRACE_MIN = 10
 MAX_LOOPS = 32
-TOOL_MIN_LOOPS = 8
 TRIM_HEAD = 800
 TRIM_TAIL = 800
 RUNS_MAX_BYTES = 5 * 1024 * 1024
 RUNS_KEEP_LINES = 500
+TOOL_RESULT_MAX_CHARS = 6000
+TOOL_RESULTS_TOTAL_CHARS = 24000
+TOOL_RESULTS_MAX_ENTRIES = 64
 STATUS_LABEL = {"ok": "성공", "fail": "실패", "skipped": "건너뜀", "deferred_timeout": "시간초과", "aborted": "중단됨", "empty": "빈 응답"}
 
 
@@ -64,21 +69,61 @@ class Budget:
         if self.remaining() <= 0:
             raise RuntimeError("시간 예산 초과")
 
-    def chat_timeout(self, effort: str) -> int:
+    def chat_timeout(self, effort: str) -> float:
         self.check()
-        return max(5, int(min(self.remaining(), int(ollama_ctl.effort_knobs(effort)["timeout"]))))
+        return max(0.001, min(self.remaining(), float(ollama_ctl.effort_knobs(effort)["timeout"])))
 
 
 @dataclass
 class TaskResult:
     text: str = ""
+    error: str | None = None
     tools_used: list[str] = field(default_factory=list)
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
+    tool_results_omitted: int = 0
+    tool_results_truncated: bool = False
     truncated: bool = False
     loops: int = 0
 
     def note_tool(self, name: str) -> None:
         if name not in self.tools_used:
             self.tools_used.append(name)
+
+
+    def note_tool_result(self, name: str, output: str, *, ok: bool,
+                         error_type: str | None = None, scrub: Callable[[str], str] | None = None) -> None:
+        """Bound evidence independently of the model transcript; redact before truncating."""
+        scrub = scrub or (lambda text: text)
+        if len(self.tool_results) >= TOOL_RESULTS_MAX_ENTRIES:
+            self.tool_results_omitted += 1
+            self.tool_results_truncated = True
+            if ok:
+                return
+            self.tool_results.pop()  # Preserve a terminal failure even after many successful calls.
+        name = scrub(str(name))[:200]
+        output = scrub(str(output))
+        remaining = max(0, TOOL_RESULTS_TOTAL_CHARS - sum(len(row["output"]) for row in self.tool_results))
+        if not ok:
+            # Keep the terminal failure message even when earlier successes used
+            # the output budget; mark the displaced evidence as truncated.
+            needed = min(len(output), TOOL_RESULT_MAX_CHARS) - remaining
+            for previous in reversed(self.tool_results):
+                if needed <= 0:
+                    break
+                removed = min(needed, len(previous["output"]))
+                if removed:
+                    previous["output"] = previous["output"][:-removed]
+                    previous["truncated"] = True
+                    self.tool_results_truncated = True
+                    remaining += removed
+                    needed -= removed
+        excerpt = output[:min(TOOL_RESULT_MAX_CHARS, remaining)]
+        shortened = len(excerpt) < len(output)
+        row = {"name": name, "output": excerpt, "ok": bool(ok), "truncated": shortened}
+        if error_type:
+            row["error_type"] = scrub(str(error_type))[:100]
+        self.tool_results.append(row)
+        self.tool_results_truncated |= shortened
 
 
 @dataclass
@@ -196,14 +241,14 @@ def run_job(job_id: str, scheduled: bool = False, wait: bool = True) -> dict:
     if not job:
         ctx = RunContext(job_id=job_id, title=job_id, model="", prompt="")
         result = _record(ctx, "fail", error="자동화를 찾을 수 없습니다.")
-        result["alert"] = alerts.notify("Free AI Scheduler 실패", f"{job_id}: 없음", ok=False, status="fail", job_id=job_id, run_id=result["id"])
+        if not scheduled:
+            result["alert"] = alerts.notify("Free AI Scheduler 실패", f"{job_id}: 없음", ok=False, status="fail", job_id=job_id, run_id=result["id"])
         _persist(job_id, result)
         return result
     ctx = RunContext.from_job(job)
-    stale = _stale_once_reason(job) if scheduled else None
-    if stale:
-        result = _record(ctx, "skipped", error=stale)
-        _finish(job, ctx, result)
+    if scheduled and not job.get("enabled", True):
+        result = _record(ctx, "skipped", error="비활성화된 자동화")
+        _persist(job_id, result)
         return result
     lock = JobLock(job_id)
     if not lock.acquire():
@@ -211,13 +256,32 @@ def run_job(job_id: str, scheduled: bool = False, wait: bool = True) -> dict:
         _persist(job_id, result)
         return result
     try:
+        current = jobs_mod.get_job(job_id)
+        if current is None:
+            return _record(ctx, "skipped", error="삭제된 자동화")
+        job = current
+        if job.get("schedule_backend") == "desk":
+            job, reason = jobs_mod.claim_desk_once(job_id, allow_early=not scheduled)
+            if reason:
+                return _record(ctx, "skipped", error=reason)
+            ctx = RunContext.from_job(job)
+        elif scheduled:
+            job = jobs_mod.get_job(job_id)
+            if not job or not job.get("enabled", True):
+                return _record(ctx, "skipped", error="삭제되었거나 비활성화된 자동화")
+            ctx = RunContext.from_job(job)
+        stale = _stale_once_reason(job) if scheduled else None
+        if stale:
+            result = _record(ctx, "skipped", error=stale)
+            _finish(job, ctx, result)
+            return result
         _write_active(ctx)
         result = _run_gated(ctx, wait)
+        _finish(job, ctx, result)
+        return result
     finally:
         _clear_active(ctx.pid)
         lock.release()
-    _finish(job, ctx, result)
-    return result
 
 
 def _stale_once_reason(job: dict[str, Any]) -> str | None:
@@ -272,6 +336,7 @@ def _execute(ctx: RunContext, verdict: dict, waited_s: int) -> dict:
     budget = Budget.minutes(ctx.max_minutes)
     cons = _collect_connectors(ctx.connector_ids)
     warnings = _run_warnings(ctx, cons)
+    task = TaskResult()
     try:
         with ollama_ctl.session(model_used):
             task = run_task(
@@ -287,7 +352,10 @@ def _execute(ctx: RunContext, verdict: dict, waited_s: int) -> dict:
                 budget=budget,
             )
     except Exception as exc:  # 실패도 기록으로 남긴다
-        return _record(ctx, "fail", error=str(exc) or exc.__class__.__name__, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
+        return _record(ctx, "fail", task=task, error=str(exc) or exc.__class__.__name__, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
+    if task.error is not None:
+        return _record(ctx, "fail", task=task, error=task.error, verdict=verdict,
+                       waited_s=waited_s, model_used=model_used, warnings=warnings)
     status, quality = _judge_output(task.text)
     warnings.extend(quality)
     return _record(ctx, status, task=task, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
@@ -336,18 +404,21 @@ def _finish(job: dict, ctx: RunContext, result: dict) -> None:
     """기록·last_run·once 해제·알림. 알림 결과는 기록의 ``alert``에 남긴다."""
     status = result["status"]
     ok = status == "ok"
-    if jobs_mod.should_alert(job, ok):
-        if ok:
-            wait = f" · 램 대기 {result.get('waited_s', 0) // 60}분" if result.get("waited_s", 0) >= 60 else ""
-            body = f"{ctx.title} · {result['seconds']}s{wait}\n{(result.get('output') or '')[:120]}"
-        else:
-            body = f"{ctx.title}\n{result.get('error') or ''}"
-        heading = f"Free AI Scheduler {STATUS_LABEL.get(status, status)}"
-        result["alert"] = alerts.notify(heading, body, ok=ok, status=status, job_id=ctx.job_id, run_id=result["id"])
+    # The result must already be available when a result window opens. A modal
+    # notification must not delay completion or leave a one-shot enabled.
     _persist(ctx.job_id, result)
     jobs_mod.mark_last_run(ctx.job_id, {k: result.get(k) for k in ("ok", "at", "seconds", "error", "status", "model_used")})
     if job.get("once"):
         jobs_mod.disable_if_once(ctx.job_id)
+    if jobs_mod.should_alert(job, ok):
+        if ok:
+            wait = f" · 램 대기 {result.get('waited_s', 0) // 60}분" if result.get("waited_s", 0) >= 60 else ""
+            body = f"{ctx.title} · {result['seconds']}s{wait}\n{result.get('output') or ''}"
+        else:
+            body = f"{ctx.title}\n{result.get('error') or ''}"
+        heading = f"Free AI Scheduler {STATUS_LABEL.get(status, status)}"
+        result["alert"] = alerts.notify(heading, body, ok=ok, status=status, job_id=ctx.job_id, run_id=result["id"])
+        _amend_alert(ctx.job_id, result)
 
 
 # --- 연동 ---------------------------------------------------------------------
@@ -386,9 +457,24 @@ def run_task(
         return _desk_run(model, prompt, effort, permission, max_loops, tools, connectors, num_ctx, budget)
     if agent == "aider":
         argv = ["aider", "--yes", "--no-auto-commits", "--model", f"ollama_chat/{model}", "-m", prompt]
-        return TaskResult(text=_run_cli("aider", argv, permission, budget), tools_used=["aider"], loops=1)
+        return TaskResult(text=_run_cli("aider", argv, permission, budget,
+                                       extra_env={"OLLAMA_API_BASE": ollama_ctl.OLLAMA_HOST}), tools_used=["aider"], loops=1)
     if agent == "opencode":
-        return TaskResult(text=_run_cli("opencode", ["opencode", "run", prompt], permission, budget), tools_used=["opencode"], loops=1)
+        # Inline config overrides user/project defaults; only the selected local
+        # provider is enabled. No cloud credentials or global config are needed.
+        config = {
+            "enabled_providers": ["ollama"],
+            "model": f"ollama/{model}",
+            "small_model": f"ollama/{model}",
+            "provider": {"ollama": {
+                "npm": "@ai-sdk/openai-compatible", "name": "Ollama (local)",
+                "options": {"baseURL": ollama_ctl.OLLAMA_HOST + "/v1"},
+                "models": {model: {"name": model}},
+            }},
+        }
+        argv = ["opencode", "run", "--model", f"ollama/{model}", prompt]
+        return TaskResult(text=_run_cli("opencode", argv, permission, budget,
+                                       extra_env={"OPENCODE_CONFIG_CONTENT": json.dumps(config)}), tools_used=["opencode"], loops=1)
     raise RuntimeError(f"에이전트 '{agent}'를 이 작업에서 아직 못 돌립니다.")
 
 
@@ -410,25 +496,28 @@ def _desk_run(
     ctx_len = int(num_ctx or ollama_ctl.effort_knobs(effort)["num_ctx"])
     if not wanted and not cons:
         payload = ollama_ctl.chat(model, prompt, effort=effort, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
-        return TaskResult(text=ollama_ctl.extract_text(payload) or "(빈 응답)", loops=1)
+        return TaskResult(text=ollama_ctl.extract_text(payload), loops=1)
 
-    loops = max(TOOL_MIN_LOOPS, _int(max_loops, 1, 1, MAX_LOOPS))
+    loops = _int(max_loops, 1, 1, MAX_LOOPS)
     skills = [c for c in cons if c.get("kind") == "skill"]
     mcp_cons = [c for c in cons if c.get("kind") == "mcp"]
     clients: dict = {}
     host = None
+    result = TaskResult()
+    connector_ids = [str(con["id"]) for con in cons if con.get("id")]
+    scrub = lambda text: _scrub_secrets(text, connector_ids)
     try:
         if mcp_cons:
             from desk import mcp_host as host
 
             clients = host.open_for_job(mcp_cons)
-        spec = tools.specs(permission, wanted, cons, clients)
+        tool_context = tools.build_context(permission, wanted, cons, clients)
+        spec = tool_context.specifications
         system = tools.system_prompt(permission, loops, skills) + _mcp_instructions(clients)
         messages: list[dict] = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ]
-        result = TaskResult()
         for _ in range(loops):
             payload = ollama_ctl.chat_messages(model, messages, effort=effort, tools=spec, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
             if payload.get("tools_dropped"):
@@ -439,18 +528,36 @@ def _desk_run(
             messages.append(msg)
             calls = ollama_ctl.extract_tool_calls(payload)
             if not calls:
-                result.text = result.text or "(빈 응답)"
                 return result
             for call in calls:
                 budget.check()
-                output = tools.run(call["name"], call.get("arguments") or {}, permission, clients, timeout=budget.remaining())
+                failures_before = len(tool_context.failures)
+                try:
+                    output = tools.run(call["name"], call.get("arguments") or {}, permission, clients,
+                                       timeout=budget.remaining(), context=tool_context)
+                except Exception as exc:
+                    result.note_tool(call["name"])
+                    result.note_tool_result(call["name"], str(exc) or type(exc).__name__, ok=False,
+                                            error_type=type(exc).__name__, scrub=scrub)
+                    raise
                 result.note_tool(call["name"])
+                failure = tool_context.failures[-1] if len(tool_context.failures) > failures_before else None
+                result.note_tool_result(call["name"], output, ok=failure is None,
+                                        error_type=failure.error_type if failure else None, scrub=scrub)
+                if failure:
+                    result.error = f"도구 '{failure.name}' 실패 ({failure.error_type}): {failure.message}"
+                    result.text = ""
+                    return result  # No model summary after missing/failed evidence.
                 messages.append(_tool_message(call, output))
             if _trim_transcript(messages, ctx_len):
                 result.truncated = True
         payload = ollama_ctl.chat_messages(model, messages, effort=effort, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
         result.loops += 1
-        result.text = ollama_ctl.extract_text(payload) or result.text or "(빈 응답)"
+        result.text = ollama_ctl.extract_text(payload)
+        return result
+    except Exception as exc:
+        result.error = str(exc) or type(exc).__name__
+        result.text = ""
         return result
     finally:
         if host is not None:
@@ -494,19 +601,18 @@ def _transcript_chars(messages: list[dict]) -> int:
     return sum(len(str(m.get("content") or "")) for m in messages)
 
 
-def _run_cli(name: str, argv: list[str], permission: str, budget: Budget) -> str:
+def _run_cli(name: str, argv: list[str], permission: str, budget: Budget, *, extra_env: dict[str, str] | None = None) -> str:
     """aider/opencode. 읽기 권한이면 거절, 작업 폴더는 권한에 따라, timeout은 남은 예산."""
     import shutil
+    from desk.tools import sandbox_run
 
     if permission == "read":
         raise RuntimeError(f"읽기 권한에서는 {name}를 실행하지 않습니다.")
     if not shutil.which(argv[0]):
         raise RuntimeError(f"{name}가 이 맥에 없습니다. 설치에서 받으세요.")
-    cwd = Path.home() if permission == "machine" else WORKSPACE
-    cwd.mkdir(parents=True, exist_ok=True)
     budget.check()
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=max(30, int(budget.remaining())), cwd=str(cwd))
+        proc = sandbox_run(argv, permission, timeout=budget.remaining(), allow_ollama=True, extra_env=extra_env)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("시간 예산 초과") from exc
     out = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
@@ -563,6 +669,13 @@ def _record(
     now = datetime.now(SEOUL)
     output_text = _scrub_secrets(task.text, ctx.connector_ids) if status == "ok" else ""
     error_text = None if status == "ok" else _scrub_secrets(error or STATUS_LABEL.get(status, status), ctx.connector_ids)
+    evidence = TaskResult()
+    for row in task.tool_results:
+        evidence.note_tool_result(row.get("name") or "", row.get("output") or "", ok=bool(row.get("ok")),
+                                  error_type=row.get("error_type"),
+                                  scrub=lambda text: _scrub_secrets(text, ctx.connector_ids))
+        if row.get("truncated"):
+            evidence.tool_results[-1]["truncated"] = True
     return {
         "id": ctx.run_id,
         "job_id": ctx.job_id,
@@ -583,6 +696,9 @@ def _record(
         "ram_action": verdict.get("action"),
         "waited_s": int(waited_s),
         "tools_used": list(task.tools_used),
+        "tool_results": evidence.tool_results,
+        "tool_results_omitted": task.tool_results_omitted + evidence.tool_results_omitted,
+        "tool_results_truncated": task.tool_results_truncated or evidence.tool_results_truncated,
         "truncated": bool(task.truncated),
         "loops": task.loops,
         "effort": ctx.effort,
@@ -598,16 +714,49 @@ def _record(
 
 def _persist(job_id: str, result: dict) -> None:
     ensure_dirs()
+    with locked():
+        path = RUNS_DIR / f"{job_id}.jsonl"
+        _rotate_jsonl(path)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(result, ensure_ascii=False) + "\n")
+        write_json(RUNS_DIR / "latest.json", result)
+        log = LOGS_DIR / f"job-{job_id}.log"
+        _rotate_log(log)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n=== {result['at']} {result.get('status') or ('ok' if result['ok'] else 'fail')} {result['seconds']}s ===\n")
+            fh.write((result.get("output") or result.get("error") or "") + "\n")
+
+
+def _amend_alert(job_id: str, result: dict) -> None:
+    """Attach the receipt to the existing run; never create another execution."""
     path = RUNS_DIR / f"{job_id}.jsonl"
-    _rotate_jsonl(path)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(result, ensure_ascii=False) + "\n")
-    (RUNS_DIR / "latest.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    log = LOGS_DIR / f"job-{job_id}.log"
-    _rotate_log(log)
-    with log.open("a", encoding="utf-8") as fh:
-        fh.write(f"\n=== {result['at']} {result.get('status') or ('ok' if result['ok'] else 'fail')} {result['seconds']}s ===\n")
-        fh.write((result.get("output") or result.get("error") or "") + "\n")
+    with locked():
+        if not path.exists():
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        found = False
+        for index, line in enumerate(lines):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("id") == result["id"]:
+                row["alert"] = result.get("alert")
+                lines[index] = json.dumps(row, ensure_ascii=False)
+                found = True
+        if not found:
+            return
+        temp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=RUNS_DIR, prefix="receipt-", delete=False)
+        try:
+            with temp:
+                temp.write("\n".join(lines) + "\n")
+            os.replace(temp.name, path)
+        finally:
+            Path(temp.name).unlink(missing_ok=True)
+        latest = read_json(RUNS_DIR / "latest.json", {})
+        if latest.get("id") == result["id"]:
+            latest["alert"] = result.get("alert")
+            write_json(RUNS_DIR / "latest.json", latest)
 
 
 def _rotate_jsonl(path: Path) -> None:
@@ -679,6 +828,25 @@ def list_runs(job_id: str | None = None, limit: int = 40) -> list[dict]:
     return [row for _, _, row in keyed[:limit]]
 
 
+def get_run(run_id: str) -> dict | None:
+    """Read one persisted result without running a job or accepting file paths."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}-[0-9]{1,20}", str(run_id)):
+        return None
+    job_id = run_id.rsplit("-", 1)[0]
+    try:
+        with (RUNS_DIR / f"{job_id}.jsonl").open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("id") == run_id:
+                    return _normalize_row(row)
+    except OSError:
+        pass
+    return None
+
+
 def runs_since(hours: int) -> list[dict]:
     """최근 hours 시간 안의 기록(타임라인용)."""
     cutoff = (datetime.now(SEOUL) - timedelta(hours=max(1, int(hours)))).isoformat(timespec="seconds")
@@ -737,28 +905,56 @@ def _pid_alive(pid: int) -> bool:
 
 
 class JobLock:
-    """data/pids/job-<id>.pid. 살아 있는 pid면 획득 실패, 죽은 pid면 이전 실행을 '중단됨'으로 정리."""
+    """Stable flock inode excludes both HTTP threads and cron processes.
+
+    The separate PID file records crashes; the lock file must never be unlinked.
+    """
 
     def __init__(self, job_id: str) -> None:
         self.job_id = job_id
         self.path = PID_DIR / f"job-{job_id}.pid"
+        self.lock_path = PID_DIR / f"job-{job_id}.lock"
+        self._handle = None
+        self._owner_pid = None
 
     def acquire(self) -> bool:
         PID_DIR.mkdir(parents=True, exist_ok=True)
-        previous = self._read()
-        if previous and previous != os.getpid() and _pid_alive(previous):
+        if self._handle is not None:
             return False
-        if previous and not _pid_alive(previous):
-            self._record_aborted(previous)
-        self.path.write_text(str(os.getpid()), encoding="utf-8")
+        handle = self.lock_path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return False
+        try:
+            previous = self._read()
+            if previous and not _pid_alive(previous):
+                self._record_aborted(previous)
+            self.path.write_text(str(os.getpid()), encoding="utf-8")
+        except BaseException:
+            handle.close()
+            raise
+        self._handle = handle
+        self._owner_pid = os.getpid()
         return True
 
     def release(self) -> None:
-        if self._read() == os.getpid():
+        if self._handle is None or self._owner_pid != os.getpid():
+            return
+        try:
+            if self._read() == os.getpid():
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+        finally:
             try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._handle.close()
+                self._handle = None
+                self._owner_pid = None
 
     def _read(self) -> int | None:
         try:
