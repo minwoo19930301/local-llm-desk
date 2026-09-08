@@ -72,6 +72,7 @@ class Budget:
 @dataclass
 class TaskResult:
     text: str = ""
+    error: str | None = None
     tools_used: list[str] = field(default_factory=list)
     truncated: bool = False
     loops: int = 0
@@ -307,6 +308,9 @@ def _execute(ctx: RunContext, verdict: dict, waited_s: int) -> dict:
             )
     except Exception as exc:  # 실패도 기록으로 남긴다
         return _record(ctx, "fail", error=str(exc) or exc.__class__.__name__, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
+    if task.error is not None:
+        return _record(ctx, "fail", task=task, error=task.error, verdict=verdict,
+                       waited_s=waited_s, model_used=model_used, warnings=warnings)
     status, quality = _judge_output(task.text)
     warnings.extend(quality)
     return _record(ctx, status, task=task, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
@@ -480,6 +484,11 @@ def _desk_run(
                 output = tools.run(call["name"], call.get("arguments") or {}, permission, clients,
                                    timeout=budget.remaining(), context=tool_context)
                 result.note_tool(call["name"])
+                if tool_context.failures:
+                    failure = tool_context.failures[-1]
+                    result.error = f"도구 '{failure.name}' 실패 ({failure.error_type}): {failure.message}"
+                    result.text = ""
+                    return result  # No model summary after missing/failed evidence.
                 messages.append(_tool_message(call, output))
             if _trim_transcript(messages, ctx_len):
                 result.truncated = True

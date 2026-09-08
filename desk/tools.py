@@ -41,6 +41,13 @@ WORKSPACE = DATA / "workspace"
 BLOCKED_HOME_DIRS = ("Library/Keychains", ".ssh", ".aws", ".gnupg", ".config/gh", ".netrc", ".codex", ".claude", ".claude.json", ".config/gogcli", ".openclaw")
 LOCAL_HOSTS = ("localhost", "0.0.0.0", "broadcasthost")
 
+@dataclass(frozen=True)
+class ToolFailure:
+    name: str
+    error_type: str
+    message: str
+
+
 @dataclass
 class ToolContext:
     permission: str
@@ -48,6 +55,7 @@ class ToolContext:
     specifications: list[dict] = field(default_factory=list)
     targets: dict[str, tuple[dict, str, dict]] = field(default_factory=dict)
     allowed_names: frozenset[str] = frozenset()
+    failures: list[ToolFailure] = field(default_factory=list)
 
 
 
@@ -264,7 +272,7 @@ def run(
             return _read_file(str(args.get("path") or ""), perm)
         target = context.targets.get(name)
         if target is None:
-            return f"모르는 도구: {name}"
+            raise RuntimeError(f"모르는 도구: {name}")
         con, tool_name, tool_metadata = target
         if name.startswith("cli__"):
             return _run_cli_connector(con, args, perm)
@@ -274,9 +282,12 @@ def run(
             if not _mcp_allowed(tool_metadata, perm):
                 raise RuntimeError("읽기 권한에서는 쓰기 MCP 도구를 실행하지 않습니다.")
             return _run_mcp_connector(con, tool_name, args, context.clients, timeout, perm)
-        return f"모르는 도구: {name}"
+        raise RuntimeError(f"모르는 도구: {name}")
     except Exception as exc:
-        return f"도구 실패: {exc}"
+        message = str(exc) or type(exc).__name__
+        if context is not None:
+            context.failures.append(ToolFailure(name, type(exc).__name__, message))
+        return f"도구 실패: {message}"
 
 
 def _run_cli_connector(con: dict, args: dict, perm: str) -> str:
@@ -456,7 +467,7 @@ def _run_cli(command: str, perm: str) -> str:
 def _cli_result(proc: subprocess.CompletedProcess) -> str:
     output = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
     if proc.returncode:
-        output += f"\nexit {proc.returncode}"
+        raise RuntimeError(f"CLI exit {proc.returncode}: {output[-MAX_OUT:] or '(출력 없음)'}")
     return output[-MAX_OUT:] or "(출력 없음)"
 
 
