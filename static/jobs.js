@@ -208,6 +208,7 @@ const collapsedResults = new Set();
 const expanded = new Set();
 const runHistory = new Map();
 const openRuns = new Set();
+const openEvidence = new Set();
 const rendered = new Map();
 
 /* ---------- form widgets ---------- */
@@ -1001,6 +1002,21 @@ function lastRunHtml(lr) {
   return `<span class="${statusClass(st)}">${label}${sec}</span>${when}${why}`;
 }
 
+function toolResultsHtml(r) {
+  const rows = Array.isArray(r.tool_results) ? r.tool_results.filter((row) => row && typeof row === "object") : [];
+  if (!rows.length) return "";
+  const omitted = Math.max(0, Math.floor(Number(r.tool_results_omitted) || 0));
+  const limited = r.tool_results_truncated || omitted > 0;
+  return `<details class="run-result run-evidence" data-evidence="${escapeHtml(r.id || "")}"${openEvidence.has(String(r.id || "")) ? " open" : ""}>
+    <summary>조회 원문 · ${rows.length}건</summary>
+    ${limited ? `<p class="legend legend--left">보관 한도로 일부 출력이 생략되었습니다.${omitted ? ` 기록하지 못한 도구 실행 ${omitted}건.` : ""}</p>` : ""}
+    ${rows.map((row, index) => `<div class="run-evidence__entry">
+      <p class="meta">${index + 1}. ${escapeHtml(row.name || "도구")} · ${row.ok ? "성공" : "실패"}${row.error_type ? ` · ${escapeHtml(row.error_type)}` : ""}${row.truncated ? " · 원문 일부" : ""}</p>
+      <pre class="run-full">${escapeHtml(row.output || "(저장된 출력 없음)")}</pre>
+    </div>`).join("")}
+  </details>`;
+}
+
 function resultHtml(jobId, r) {
   const st = runStatus(r);
   const label = STATUS_LABEL[st] || st;
@@ -1010,6 +1026,7 @@ function resultHtml(jobId, r) {
   return `<details class="run-result" data-result="${jobId}"${open}>
     <summary><span class="${statusClass(st)}">${label}</span> ${Math.round(r.seconds || 0)}s${model ? " · " + escapeHtml(model) : ""}</summary>
     <pre class="run-full">${escapeHtml(body || "(출력 없음)")}</pre>
+    ${toolResultsHtml(r)}
   </details>`;
 }
 
@@ -1032,7 +1049,7 @@ function runRowHtml(r) {
       <span class="run-row__meta">${escapeHtml(fmtTime(r.at))} · <span class="${statusClass(st)}">${label}</span> · ${Math.round(r.seconds || 0)}s${model ? " · " + escapeHtml(model) : ""}</span>
       ${!open && head ? `<span class="run-row__out">${escapeHtml(head)}${String(body).length > 200 ? "…" : ""}</span>` : ""}
     </button>
-    ${open ? `<pre class="run-full">${escapeHtml(body || "(출력 없음)")}</pre>` : ""}
+    ${open ? `<pre class="run-full">${escapeHtml(body || "(출력 없음)")}</pre>${toolResultsHtml(r)}` : ""}
   </div>`;
 }
 
@@ -1186,6 +1203,12 @@ jobList.addEventListener("click", async (ev) => {
 });
 
 jobList.addEventListener("toggle", (ev) => {
+  const evidence = ev.target.closest("details[data-evidence]");
+  if (evidence) {
+    if (evidence.open) openEvidence.add(evidence.dataset.evidence);
+    else openEvidence.delete(evidence.dataset.evidence);
+    return;
+  }
   const det = ev.target.closest("details[data-result]");
   if (!det) return;
   if (det.open) collapsedResults.delete(det.dataset.result);
@@ -1359,7 +1382,7 @@ function paintCron(data) {
 async function showSettings(status) {
   const alerts = (status && status.alerts) || {};
   document.getElementById("alertMacos").checked = alerts.macos !== false;
-  document.getElementById("alertDialog").checked = alerts.macos_mode === "dialog";
+  document.getElementById("alertMode").value = ["notification", "dialog", "window"].includes(alerts.macos_mode) ? alerts.macos_mode : "notification";
   document.getElementById("alertSound").checked = alerts.sound !== false;
   document.getElementById("alertWebhook").value = alerts.webhook || "";
   document.getElementById("alertResult").textContent = "";
@@ -1375,7 +1398,7 @@ async function showSettings(status) {
 function alertsPayload() {
   return {
     macos: document.getElementById("alertMacos").checked,
-    macos_mode: document.getElementById("alertDialog").checked ? "dialog" : "notification",
+    macos_mode: document.getElementById("alertMode").value,
     sound: document.getElementById("alertSound").checked,
     webhook: document.getElementById("alertWebhook").value.trim(),
   };
@@ -1387,6 +1410,7 @@ function alertResultLine(r) {
   const bits = [];
   const m = r.macos;
   if (!m) bits.push("macOS 꺼짐");
+  else if (m.ok && m.mode === "window") bits.push("브라우저에 저장 결과 열기 요청 완료");
   else if (m.ok && m.mode === "dialog") bits.push(m.acknowledged ? "확인 창 · 확인 누름" : "확인 창 · 45초 후 닫힘 (확인 안 됨)");
   else if (m.ok) bits.push("macOS 전달 요청 완료 · 실제 표시는 시스템 설정에 따름");
   else bits.push(`macOS ✗ ${m.stderr || (m.code != null ? "code " + m.code : "")}`.trim());

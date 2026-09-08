@@ -5,6 +5,7 @@ import json
 import subprocess
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -32,7 +33,9 @@ def notify(
     alerts = load_config().get("alerts") or {}
     result: dict[str, Any] = {"macos": None, "webhook": None}
     if alerts.get("macos", True):
-        if alerts.get("macos_mode") == "dialog":
+        if alerts.get("macos_mode") == "window":
+            result["macos"] = _macos_window(run_id)
+        elif alerts.get("macos_mode") == "dialog":
             result["macos"] = _macos_dialog(title, body, sound=bool(alerts.get("sound", True)))
         else:
             result["macos"] = _macos(title, body, ok=ok, kind=kind, sound=bool(alerts.get("sound", True)))
@@ -111,6 +114,32 @@ def _macos_dialog(title: str, body: str, sound: bool) -> dict[str, Any]:
     return {"ok": success, "mode": "dialog", "acknowledged": success and receipt == "acknowledged",
             "expired": success and receipt == "expired", "code": proc.returncode,
             "stderr": (proc.stderr or "").strip()[:200]}
+
+
+def _macos_window(run_id: str) -> dict[str, Any]:
+    """Ask Launch Services to open only this Desk's already-persisted result.
+
+    Exit zero is an accepted open request, not evidence that a browser window
+    was visible or that the user read it. Never opens model-provided URLs.
+    """
+    receipt: dict[str, Any] = {
+        "ok": False, "mode": "window", "opened": False, "submitted": False,
+        "visible": None, "code": None, "stderr": "",
+    }
+    if not run_id:
+        receipt["stderr"] = "브라우저 결과 창은 저장된 작업 결과가 있어야 열 수 있습니다. 실행 기록에서 결과를 여세요."
+        return receipt
+    url = APP_URL + "/jobs?run=" + quote(str(run_id), safe="")
+    receipt["url"] = url
+    try:
+        proc = subprocess.run(["open", url], check=False, capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError) as exc:
+        receipt["stderr"] = str(exc)[:200]
+        return receipt
+    submitted = proc.returncode == 0
+    receipt.update(ok=submitted, opened=submitted, submitted=submitted,
+                   code=proc.returncode, stderr=(proc.stderr or "").strip()[:200])
+    return receipt
 
 
 def _webhook(url: str, payload: dict[str, Any]) -> dict[str, Any]:

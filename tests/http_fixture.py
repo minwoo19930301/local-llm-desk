@@ -23,6 +23,7 @@ def isolated_server():
         stack.enter_context(mock.patch.object(crontab_sync, "apply", return_value={"ok": True, "preview": "", "jobs": 0}))
         stack.enter_context(mock.patch.object(crontab_sync, "current_user_crontab", return_value=""))
         stack.enter_context(mock.patch.object(alerts, "notify", return_value={"ok": True, "test_stub": True}))
+        stack.enter_context(mock.patch.object(alerts, "_macos_window", return_value={"ok": True, "mode": "window", "opened": True, "submitted": True, "visible": None, "test_stub": True}))
         stack.enter_context(mock.patch.object(ollama_ctl, "running", return_value=False))
         stack.enter_context(mock.patch.object(ollama_ctl, "model_inventory", return_value=[{"name": "fixture-model:latest"}]))
         stack.enter_context(mock.patch.object(ollama_ctl, "session", side_effect=lambda *a, **k: nullcontext()))

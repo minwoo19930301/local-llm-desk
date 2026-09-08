@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import re
+import tempfile
 from collections import Counter
 import time
 import traceback
@@ -28,6 +29,7 @@ if str(ROOT) not in sys.path:
 
 from desk import alerts, jobs as jobs_mod, ollama_ctl, ramgate  # noqa: E402
 from desk.paths import DATA, LOGS_DIR, PID_DIR, RUNS_DIR, ensure_dirs  # noqa: E402
+from desk.state import locked, read_json, write_json  # noqa: E402
 
 SEOUL = ZoneInfo("Asia/Seoul")
 ACTIVE_FILE = RUNS_DIR / "active.json"
@@ -402,6 +404,12 @@ def _finish(job: dict, ctx: RunContext, result: dict) -> None:
     """기록·last_run·once 해제·알림. 알림 결과는 기록의 ``alert``에 남긴다."""
     status = result["status"]
     ok = status == "ok"
+    # The result must already be available when a result window opens. A modal
+    # notification must not delay completion or leave a one-shot enabled.
+    _persist(ctx.job_id, result)
+    jobs_mod.mark_last_run(ctx.job_id, {k: result.get(k) for k in ("ok", "at", "seconds", "error", "status", "model_used")})
+    if job.get("once"):
+        jobs_mod.disable_if_once(ctx.job_id)
     if jobs_mod.should_alert(job, ok):
         if ok:
             wait = f" · 램 대기 {result.get('waited_s', 0) // 60}분" if result.get("waited_s", 0) >= 60 else ""
@@ -410,10 +418,7 @@ def _finish(job: dict, ctx: RunContext, result: dict) -> None:
             body = f"{ctx.title}\n{result.get('error') or ''}"
         heading = f"Free AI Scheduler {STATUS_LABEL.get(status, status)}"
         result["alert"] = alerts.notify(heading, body, ok=ok, status=status, job_id=ctx.job_id, run_id=result["id"])
-    _persist(ctx.job_id, result)
-    jobs_mod.mark_last_run(ctx.job_id, {k: result.get(k) for k in ("ok", "at", "seconds", "error", "status", "model_used")})
-    if job.get("once"):
-        jobs_mod.disable_if_once(ctx.job_id)
+        _amend_alert(ctx.job_id, result)
 
 
 # --- 연동 ---------------------------------------------------------------------
@@ -709,16 +714,49 @@ def _record(
 
 def _persist(job_id: str, result: dict) -> None:
     ensure_dirs()
+    with locked():
+        path = RUNS_DIR / f"{job_id}.jsonl"
+        _rotate_jsonl(path)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(result, ensure_ascii=False) + "\n")
+        write_json(RUNS_DIR / "latest.json", result)
+        log = LOGS_DIR / f"job-{job_id}.log"
+        _rotate_log(log)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n=== {result['at']} {result.get('status') or ('ok' if result['ok'] else 'fail')} {result['seconds']}s ===\n")
+            fh.write((result.get("output") or result.get("error") or "") + "\n")
+
+
+def _amend_alert(job_id: str, result: dict) -> None:
+    """Attach the receipt to the existing run; never create another execution."""
     path = RUNS_DIR / f"{job_id}.jsonl"
-    _rotate_jsonl(path)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(result, ensure_ascii=False) + "\n")
-    (RUNS_DIR / "latest.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    log = LOGS_DIR / f"job-{job_id}.log"
-    _rotate_log(log)
-    with log.open("a", encoding="utf-8") as fh:
-        fh.write(f"\n=== {result['at']} {result.get('status') or ('ok' if result['ok'] else 'fail')} {result['seconds']}s ===\n")
-        fh.write((result.get("output") or result.get("error") or "") + "\n")
+    with locked():
+        if not path.exists():
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        found = False
+        for index, line in enumerate(lines):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("id") == result["id"]:
+                row["alert"] = result.get("alert")
+                lines[index] = json.dumps(row, ensure_ascii=False)
+                found = True
+        if not found:
+            return
+        temp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=RUNS_DIR, prefix="receipt-", delete=False)
+        try:
+            with temp:
+                temp.write("\n".join(lines) + "\n")
+            os.replace(temp.name, path)
+        finally:
+            Path(temp.name).unlink(missing_ok=True)
+        latest = read_json(RUNS_DIR / "latest.json", {})
+        if latest.get("id") == result["id"]:
+            latest["alert"] = result.get("alert")
+            write_json(RUNS_DIR / "latest.json", latest)
 
 
 def _rotate_jsonl(path: Path) -> None:
@@ -788,6 +826,25 @@ def list_runs(job_id: str | None = None, limit: int = 40) -> list[dict]:
             keyed.append((row.get("at") or "", index, row))  # 같은 초에 여러 건이면 파일 뒤쪽이 최신
     keyed.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [row for _, _, row in keyed[:limit]]
+
+
+def get_run(run_id: str) -> dict | None:
+    """Read one persisted result without running a job or accepting file paths."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}-[0-9]{1,20}", str(run_id)):
+        return None
+    job_id = run_id.rsplit("-", 1)[0]
+    try:
+        with (RUNS_DIR / f"{job_id}.jsonl").open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("id") == run_id:
+                    return _normalize_row(row)
+    except OSError:
+        pass
+    return None
 
 
 def runs_since(hours: int) -> list[dict]:

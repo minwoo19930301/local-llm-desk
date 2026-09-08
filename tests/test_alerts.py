@@ -48,5 +48,40 @@ class AlertReceipts(unittest.TestCase):
             self.assertFalse(receipt['acknowledged'])
 
 
+class WindowReceipts(unittest.TestCase):
+    def test_window_opens_only_fixed_local_result_url_with_encoded_identifier(self):
+        run_id = 'saved &next=https://example.invalid/evil#fragment'
+        with patch.object(alerts, 'load_config', return_value={'alerts': {'macos': True, 'macos_mode': 'window'}}), patch.object(alerts.subprocess, 'run', return_value=Mock(returncode=0, stderr='')) as run:
+            receipt = alerts.notify('ignored', 'https://example.invalid/not-opened', run_id=run_id)['macos']
+        self.assertEqual(run.call_args.args[0], ['open', 'http://127.0.0.1:8788/jobs?run=saved%20%26next%3Dhttps%3A%2F%2Fexample.invalid%2Fevil%23fragment'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 5)
+        self.assertTrue(receipt['opened'])
+        self.assertTrue(receipt['submitted'])
+        self.assertIsNone(receipt['visible'])
+        self.assertNotIn('acknowledged', receipt)
+
+    def test_window_disabled_or_test_without_saved_run_never_opens_browser(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch.object(alerts, 'load_config', return_value={'alerts': {'macos': enabled, 'macos_mode': 'window'}}), patch.object(alerts.subprocess, 'run') as run:
+                receipt = alerts.test()['macos']
+            run.assert_not_called()
+            if enabled:
+                self.assertFalse(receipt['ok'])
+                self.assertFalse(receipt['submitted'])
+                self.assertIn('저장된 작업 결과', receipt['stderr'])
+            else:
+                self.assertIsNone(receipt)
+
+    def test_window_failed_open_and_timeout_are_not_submission(self):
+        for outcome in (Mock(returncode=1, stderr='no GUI session'), subprocess.TimeoutExpired('open', 5), OSError('missing opener')):
+            kwargs = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
+            with self.subTest(outcome=outcome), patch.object(alerts.subprocess, 'run', **kwargs):
+                receipt = alerts._macos_window('saved')
+            self.assertFalse(receipt['ok'])
+            self.assertFalse(receipt['opened'])
+            self.assertFalse(receipt['submitted'])
+            self.assertIsNone(receipt['visible'])
+
+
 if __name__ == '__main__':
     unittest.main()

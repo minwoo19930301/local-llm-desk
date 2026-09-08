@@ -26,7 +26,7 @@ from typing import Any, Callable, Mapping
 from desk import catalog, crontab_sync, installer, jobs as jobs_mod, links, ollama_ctl, runner
 from desk.hardware import detect
 from desk.paths import DATA, STATIC
-from desk.state import load_config, locked, save_config
+from desk.state import MACOS_ALERT_MODES, load_config, locked, save_config
 
 HOST = "127.0.0.1"
 PORT = 8788
@@ -454,6 +454,15 @@ def _runs(req: Request) -> Result:
     return 200, {"runs": runner.list_runs(job_id, limit)}
 
 
+@route("POST", r"/api/runs/(?P<id>[^/]+)/open")
+def _runs_open(req: Request) -> Result:
+    """Open a persisted result without fetching data, running a job, or changing alert settings."""
+    run_id = req.params["id"]
+    if runner.get_run(run_id) is None:
+        raise KeyError(run_id)
+    return 200, _alerts()._macos_window(run_id)
+
+
 @route("GET", r"/api/crontab")
 def _crontab(req: Request) -> Result:
     installed = crontab_sync.current_user_crontab()
@@ -625,8 +634,8 @@ def _clean_webhook(raw: Any) -> str:
 @route("POST", r"/api/alerts")
 def _alerts_save(req: Request) -> Result:
     body = req.body
-    if "macos_mode" in body and body["macos_mode"] not in ("notification", "dialog"):
-        raise ValueError("macOS 알림 방식은 notification 또는 dialog여야 합니다.")
+    if "macos_mode" in body and body["macos_mode"] not in MACOS_ALERT_MODES:
+        raise ValueError("macOS 알림 방식은 notification, dialog 또는 window여야 합니다.")
     with locked():
         cfg = load_config()
         alerts = cfg["alerts"]

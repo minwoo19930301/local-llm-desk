@@ -1,6 +1,6 @@
 {
   "name": "local-llm-desk-tests",
   "private": true,
-  "scripts": { "test:browser": "node tests/browser.cjs" },
+  "scripts": { "test:browser": "node tests/test_run_evidence_ui.cjs && node tests/browser.cjs" },
   "devDependencies": { "playwright": "1.62.0" }
 }
