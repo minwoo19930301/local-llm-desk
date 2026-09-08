@@ -79,7 +79,7 @@ def managed_block(jobs: list[dict[str, Any]]) -> str:
     ]
     for job in jobs:
         cron = (job.get("cron") or "").strip()
-        if not job.get("enabled") or not valid_cron(cron):
+        if job.get("schedule_backend") == "desk" or not job.get("enabled") or not valid_cron(cron):
             continue
         command = f"DESK_PYTHON={shlex.quote(sys.executable)} {shlex.quote(str(CRON_WRAP))} {shlex.quote(str(job['id']))}"
         # cron processes percent signs before the shell, even inside quotes.
@@ -102,7 +102,7 @@ def compose(existing: str, jobs: list[dict[str, Any]]) -> str:
     """Existing crontab minus our block, plus a fresh block when any job is scheduled."""
     stripped = strip_managed(existing)
     block = managed_block(jobs)
-    scheduled = any(j.get("enabled") and valid_cron(j.get("cron") or "") for j in jobs)
+    scheduled = any(j.get("schedule_backend") != "desk" and j.get("enabled") and valid_cron(j.get("cron") or "") for j in jobs)
     base = stripped.rstrip()
     if not scheduled:
         new = base + ("\n" if base else "")

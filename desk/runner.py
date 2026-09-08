@@ -196,7 +196,8 @@ def run_job(job_id: str, scheduled: bool = False, wait: bool = True) -> dict:
     if not job:
         ctx = RunContext(job_id=job_id, title=job_id, model="", prompt="")
         result = _record(ctx, "fail", error="자동화를 찾을 수 없습니다.")
-        result["alert"] = alerts.notify("Free AI Scheduler 실패", f"{job_id}: 없음", ok=False, status="fail", job_id=job_id, run_id=result["id"])
+        if not scheduled:
+            result["alert"] = alerts.notify("Free AI Scheduler 실패", f"{job_id}: 없음", ok=False, status="fail", job_id=job_id, run_id=result["id"])
         _persist(job_id, result)
         return result
     ctx = RunContext.from_job(job)
@@ -204,17 +205,31 @@ def run_job(job_id: str, scheduled: bool = False, wait: bool = True) -> dict:
         result = _record(ctx, "skipped", error="비활성화된 자동화")
         _persist(job_id, result)
         return result
-    stale = _stale_once_reason(job) if scheduled else None
-    if stale:
-        result = _record(ctx, "skipped", error=stale)
-        _finish(job, ctx, result)
-        return result
     lock = JobLock(job_id)
     if not lock.acquire():
         result = _record(ctx, "skipped", error="이미 실행 중")
         _persist(job_id, result)
         return result
     try:
+        current = jobs_mod.get_job(job_id)
+        if current is None:
+            return _record(ctx, "skipped", error="삭제된 자동화")
+        job = current
+        if job.get("schedule_backend") == "desk":
+            job, reason = jobs_mod.claim_desk_once(job_id, allow_early=not scheduled)
+            if reason:
+                return _record(ctx, "skipped", error=reason)
+            ctx = RunContext.from_job(job)
+        elif scheduled:
+            job = jobs_mod.get_job(job_id)
+            if not job or not job.get("enabled", True):
+                return _record(ctx, "skipped", error="삭제되었거나 비활성화된 자동화")
+            ctx = RunContext.from_job(job)
+        stale = _stale_once_reason(job) if scheduled else None
+        if stale:
+            result = _record(ctx, "skipped", error=stale)
+            _finish(job, ctx, result)
+            return result
         _write_active(ctx)
         result = _run_gated(ctx, wait)
         _finish(job, ctx, result)

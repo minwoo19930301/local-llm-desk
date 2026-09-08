@@ -121,17 +121,17 @@ class CreateUpdate(TempData):
         with mock.patch.object(jobs, "_now", return_value=now):
             job = self._create(preset="once_5m")
         self.assertTrue(job["once"])
-        self.assertEqual(job["cron"], "3 0 1 1 *")
-        self.assertEqual(job["once_at"], "2027-01-01T00:03:00+00:00")
+        self.assertEqual(job["cron"], "")
+        self.assertEqual(job["schedule_backend"], "desk")
+        self.assertEqual(job["once_at"], "2027-01-01T00:02:42+00:00")
         delay = datetime.fromisoformat(job["once_at"]) - now
-        self.assertGreaterEqual(delay, timedelta(minutes=5))
-        self.assertLess(delay, timedelta(minutes=6))
+        self.assertEqual(delay, timedelta(minutes=5))
 
     def test_five_minute_once_on_minute_boundary_is_exact(self) -> None:
         now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
         with mock.patch.object(jobs, "_now", return_value=now):
             job = self._create(preset="once_5m")
-            self.assertEqual(jobs.resolve_schedule("once_5m"), ("5 12 8 9 *", True))
+            self.assertEqual(jobs.resolve_schedule("once_5m"), ("", True))
         self.assertEqual(job["once_at"], "2026-09-08T12:05:00+00:00")
 
     def test_five_minute_once_edits_and_toggle_do_not_rearm(self) -> None:

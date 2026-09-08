@@ -667,6 +667,7 @@ def _models_remove(req: Request) -> Result:
 
 
 def serve(open_browser: bool = True) -> None:
+    from desk import oneshot
     from desk.paths import ensure_dirs
 
     ensure_dirs()
@@ -677,8 +678,11 @@ def serve(open_browser: bool = True) -> None:
         import webbrowser
 
         webbrowser.open(url)
+    oneshot.start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstop", flush=True)
+    finally:
+        oneshot.stop()
         httpd.server_close()
