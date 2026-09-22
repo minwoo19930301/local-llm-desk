@@ -1,11 +1,5 @@
 # Free AI Scheduler
 
-<!-- PROJECT-PRESENTATION:START -->
-<a href="https://github.com/minwoo19930301/local-llm-desk"><img src=".github/project-cover.svg" alt="Free AI Scheduler" width="960"></a>
-
-[![SOURCE](https://img.shields.io/badge/SOURCE-444444?style=for-the-badge)](https://github.com/minwoo19930301/local-llm-desk)
-<!-- PROJECT-PRESENTATION:END -->
-
 각 사람 맥에서 Ollama로 로컬 모델을 받고, cron 자동화로 돌린다.
 
 사람마다 HOME·경로가 다르다. crontab에 사용자 이름이나 `/Users/누구`를 넣지 않는다. `desk/cron_wrap.sh`가 자기 위치를 기준으로 실행한다.
