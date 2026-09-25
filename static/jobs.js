@@ -27,7 +27,7 @@ const SCHEDULE = {
 };
 
 const STATUS_LABEL = {
-  ok: "성공",
+  ok: "응답 완료·검증 필요",
   fail: "실패",
   skipped: "건너뜀",
   deferred_timeout: "시간초과",
@@ -777,9 +777,11 @@ function paintTools(selected) {
     multi: true,
     empty: "글만",
     items: [
+      { id: "file", name: "파일 읽기", line: "권한 범위의 파일 조회", selected: on.has("file") },
+      { id: "mail", name: "네이버 메일 · POP3", line: "기존 AGY 설정 또는 키체인으로 최근 메일 헤더 조회", selected: on.has("mail") },
       { id: "cli", name: "CLI", line: "이 자동화에서 셸 명령을 실행", selected: on.has("cli") },
       { id: "http", name: "API", line: "이 자동화에서 HTTP를 호출", selected: on.has("http") },
-      { id: "chrome", name: "Chrome", line: "이 자동화에서 브라우저를 염", selected: on.has("chrome") },
+      { id: "chrome", name: "브라우저 주소 열기", line: "Chrome에 URL만 열기 · 화면 읽기/클릭 아님", selected: on.has("chrome") },
     ],
   });
 }
@@ -807,7 +809,7 @@ async function reloadModels() {
   DD.mount("jobAgentDrop", {
     label: "에이전트",
     items: [
-      { id: "chat", name: "이 앱", line: "에이전트 없이, 이 실행의 도구만", selected: true },
+      { id: "chat", name: "이 앱", line: "내장 에이전트 루프로 선택한 도구 실행", selected: true },
       { id: "aider", name: "Aider", line: have.has("aider") ? "설치됨" : "아직 안 깔림", disabled: !have.has("aider") },
       { id: "opencode", name: "OpenCode", line: have.has("opencode") ? "설치됨" : "아직 안 깔림", disabled: !have.has("opencode") },
     ],
@@ -1296,11 +1298,12 @@ tryBtn.addEventListener("click", async () => {
 
 function showTry(data) {
   const model = data.model_used || data.model || "";
-  const head = data.ok ? `성공 ${data.seconds}s${model ? " · " + model : ""}` : `실패 ${data.seconds || 0}s`;
+  const head = data.ok ? `응답 완료 · 작업 달성은 별도 확인 ${data.seconds}s${model ? " · " + model : ""}` : `실패 ${data.seconds || 0}s`;
   const note = data.ram_note ? `\n${data.ram_note}` : "";
   const body = data.ok ? data.output : "";
   if (!data.ok) showEditError(data.error || "실패");
-  tryOut.textContent = head + note + "\n\n" + (body || "");
+  const trace = (data.tool_trace || []).map(t => `${t.ok ? "✓" : "✗"} ${t.name} · ${t.seconds}s`).join("\n");
+  tryOut.textContent = head + note + "\n" + trace + "\n\n" + (body || "");
 }
 
 /* ---------- settings ---------- */
@@ -1447,3 +1450,23 @@ setInterval(() => {
   const live = jobList.querySelector(`[data-live="${activeRun.job_id}"]`);
   if (live) live.textContent = `실행 중… ${elapsedText()}`;
 }, 1000);
+
+// Direct diagnostics never call a language model.
+document.querySelectorAll('[data-diagnose]').forEach(button => {
+  button.addEventListener('click', async () => {
+    const out = document.getElementById('toolDiagnosis'); button.disabled = true; out.textContent = '도구 직접 확인 중…';
+    try { out.textContent = JSON.stringify(await post('/api/tools/diagnose', {kind:button.dataset.diagnose}), null, 2); }
+    catch(e) { out.textContent = e.message; } finally { button.disabled = false; }
+  });
+});
+document.getElementById('mailSave').addEventListener('click', async () => {
+  const password = document.getElementById('mailPassword'), out = document.getElementById('mailResult');
+  const value = password.value; password.value = ''; out.textContent = '키체인 저장 중…';
+  try { const data = await post('/api/mail/save', {account:document.getElementById('mailAccount').value, password:value}); out.textContent = data.message; }
+  catch(e) { out.textContent = e.message; }
+});
+document.getElementById('mailTest').addEventListener('click', async () => {
+  const out = document.getElementById('mailResult'); out.textContent = '인증·목록 확인 중…';
+  try { out.textContent = JSON.stringify(await post('/api/mail/test', {}), null, 2); }
+  catch(e) { out.textContent = e.message; }
+});

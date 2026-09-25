@@ -140,6 +140,16 @@
         <p class="ram-line ram-line--form" id="editRam"></p>
         <div id="jobAgentDrop"></div>
         <div id="jobToolsDrop"></div>
+        <p class="legend legend--left">파일·CLI·공개 웹/API·주소 열기·네이버 메일을 각각 선택합니다. 화면을 읽고 클릭하는 Browser/Computer Use는 연동 관리에서 해당 MCP 서버를 등록하고 아래에서 선택하세요. 주소 열기만으로 화면 조작은 되지 않습니다.</p>
+        <details><summary>모델 없이 도구 자체 확인</summary>
+          <div class="row">
+            <button type="button" data-diagnose="file">파일 읽기</button>
+            <button type="button" data-diagnose="cli">CLI 실행</button>
+            <button type="button" data-diagnose="http">HTTP 조회</button>
+            <button type="button" data-diagnose="mail-network">POP3 서버 연결</button>
+            <button type="button" data-diagnose="mail">메일 목록 조회</button>
+          </div><pre class="log" id="toolDiagnosis" role="status"></pre>
+        </details>
         <div id="connectorsDrop"></div>
         <p class="legend legend--left"><a class="link" href="/connectors" id="manageConnectors">연동 관리 →</a></p>
         <textarea id="prompt" class="note" placeholder="예: 오늘 할 일을 세 줄로 요약해 줘." aria-label="시킬 일"></textarea>
@@ -176,6 +186,15 @@
         <p class="gds-heading__title">연동</p>
       </div>
       <p class="legend legend--left">MCP 서버 · CLI 명령 · HTTP API · 스킬을 등록해 두고, 각 자동화에서 필요한 것만 골라 붙입니다.</p>
+      <h2 class="sec-title">네이버 메일 · POP3</h2>
+      <p>기존 AGY 설정(~/.env의 NAVER_MAIL_USERNAME·NAVER_MAIL_PASSWORD)이 있으면 재입력 없이 아래 연결 확인 버튼으로 사용합니다. 새 계정은 네이버에서 POP3를 켠 뒤 등록하세요. 새로 등록한 비밀번호는 macOS 키체인에 저장합니다. 기존 설정의 비밀번호는 복사하지 않으며, 어느 방식이든 모델에 전달하지 않습니다. 최근 메일의 제목·보낸사람·날짜만 조회합니다.</p>
+      <p><a href="https://help.naver.com/service/30029/contents/21341?lang=ko&osType=PC" target="_blank" rel="noopener noreferrer">네이버 설정 안내</a></p>
+      <div class="stack">
+        <label>네이버 메일 <input type="email" id="mailAccount" class="gds-text-field__input" autocomplete="username" placeholder="name@naver.com"></label>
+        <label>앱 비밀번호 <input type="password" id="mailPassword" class="gds-text-field__input" autocomplete="new-password"></label>
+        <div class="row"><button type="button" id="mailSave" class="gds-button gds-button--cta">키체인에 저장</button><button type="button" id="mailTest" class="gds-button gds-button--secondary">모델 없이 연결·목록 확인</button></div>
+        <pre class="log" id="mailResult" role="status"></pre>
+      </div>
       <h2 class="sec-title">등록된 연동</h2>
       <div class="connector-list" id="conList"></div>
       <h2 class="sec-title">이 맥에서 찾은 연동</h2>

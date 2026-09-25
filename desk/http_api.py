@@ -403,6 +403,54 @@ def _jobs_delete(req: Request) -> Result:
     return 200, jobs_mod.delete_job(req.params["id"])
 
 
+@route("POST", r"/api/tools/diagnose")
+def _tools_diagnose(req):
+    from desk import tools, mail
+    import tempfile
+    import time
+    kind = req.body.get("kind")
+    began = time.monotonic()
+    try:
+        if kind == "cli":
+            output = tools._run_cli("printf desk-tool-ok", "workspace")
+            ok = output == "desk-tool-ok"
+        elif kind == "file":
+            tools.WORKSPACE.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=tools.WORKSPACE, mode="w+", encoding="utf-8") as fh:
+                fh.write("desk-file-ok"); fh.flush()
+                output = tools._read_file(fh.name, "workspace")
+            ok = output == "desk-file-ok"
+        elif kind == "mail":
+            return 200, mail.headers(5)
+        elif kind == "mail-network":
+            return 200, mail.network_check()
+        elif kind == "http":
+            output = tools._http("GET", "https://example.com", None, "read")
+            ok = "Example Domain" in output
+        else:
+            raise ValueError("지원하지 않는 진단입니다.")
+        return 200, {"ok": ok, "kind": kind, "seconds": round(time.monotonic()-began, 2), "output": output[:300]}
+    except RuntimeError as exc:
+        return 200, {"ok": False, "kind": kind, "error": str(exc)}
+    except Exception:
+        return 200, {"ok": False, "kind": kind, "error": "도구 진단 실패. 연결 또는 권한 설정을 확인하세요."}
+
+
+@route("POST", r"/api/mail/save")
+def _mail_save(req):
+    from desk import mail
+    return 200, mail.save(req.body.get("account", ""), req.body.get("password", ""))
+
+
+@route("POST", r"/api/mail/test")
+def _mail_test(req):
+    from desk import mail
+    try:
+        return 200, mail.network_check() if req.body.get("network_only") else mail.headers(5)
+    except RuntimeError as exc:
+        return 200, {"ok": False, "error": str(exc)}
+
+
 @route("POST", r"/api/jobs/try")
 def _jobs_try(req: Request) -> Result:
     body = req.body

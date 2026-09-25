@@ -41,7 +41,7 @@ TRIM_HEAD = 800
 TRIM_TAIL = 800
 RUNS_MAX_BYTES = 5 * 1024 * 1024
 RUNS_KEEP_LINES = 500
-STATUS_LABEL = {"ok": "성공", "fail": "실패", "skipped": "건너뜀", "deferred_timeout": "시간초과", "aborted": "중단됨", "empty": "빈 응답"}
+STATUS_LABEL = {"ok": "응답 완료 (작업 달성 미검증)", "fail": "실패", "skipped": "건너뜀", "deferred_timeout": "시간초과", "aborted": "중단됨", "empty": "빈 응답"}
 
 
 # --- 실행 컨텍스트 ------------------------------------------------------------
@@ -75,6 +75,9 @@ class TaskResult:
     tools_used: list[str] = field(default_factory=list)
     truncated: bool = False
     loops: int = 0
+    tool_trace: list[dict] = field(default_factory=list)
+    tool_errors: int = 0
+    incomplete: bool = False
 
     def note_tool(self, name: str) -> None:
         if name not in self.tools_used:
@@ -290,7 +293,10 @@ def _execute(ctx: RunContext, verdict: dict, waited_s: int) -> dict:
         return _record(ctx, "fail", error=str(exc) or exc.__class__.__name__, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
     status, quality = _judge_output(task.text)
     warnings.extend(quality)
-    return _record(ctx, status, task=task, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
+    if task.tool_errors or task.incomplete:
+        status = "fail"
+        warnings.append("도구 실패 또는 실행 미완료: 작업 결과를 확인하세요.")
+    return _record(ctx, status, task=task, error="도구 실행 실패 또는 호출 미완료. 실행 내역을 확인하세요." if task.tool_errors or task.incomplete else None, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
 
 
 LIVE_INFO_RE = re.compile(r"오늘|최신|뉴스|날씨|지금|현재|실시간|어제|이번 주|주가|환율|속보")
@@ -423,6 +429,7 @@ def _desk_run(
 
             clients = host.open_for_job(mcp_cons)
         spec = tools.specs(permission, wanted, cons, clients)
+        allowed_tools = {item["function"]["name"] for item in spec}
         system = tools.system_prompt(permission, loops, skills) + _mcp_instructions(clients)
         messages: list[dict] = [
             {"role": "system", "content": system},
@@ -439,15 +446,22 @@ def _desk_run(
             messages.append(msg)
             calls = ollama_ctl.extract_tool_calls(payload)
             if not calls:
+                result.incomplete = (bool(spec) and not result.tools_used) or bool(re.search(r'"(?:name|function)"\s*:\s*"(?:run_cli|read_file|chrome_open|mail_headers|http_request)"', result.text))
                 result.text = result.text or "(빈 응답)"
                 return result
             for call in calls:
                 budget.check()
-                output = tools.run(call["name"], call.get("arguments") or {}, permission, clients, timeout=budget.remaining())
+                began = time.monotonic()
+                output = (tools.run(call["name"], call.get("arguments") or {}, permission, clients, timeout=budget.remaining())
+                          if call["name"] in allowed_tools else "도구 실패: 이 작업에서 선택하지 않은 도구입니다.")
+                failed = output.startswith(("도구 실패:", "모르는 도구:"))
+                result.tool_errors += int(failed)
+                result.tool_trace.append({"name": call["name"], "ok": not failed, "seconds": round(time.monotonic()-began, 3)})
                 result.note_tool(call["name"])
                 messages.append(_tool_message(call, output))
             if _trim_transcript(messages, ctx_len):
                 result.truncated = True
+        result.incomplete = True
         payload = ollama_ctl.chat_messages(model, messages, effort=effort, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
         result.loops += 1
         result.text = ollama_ctl.extract_text(payload) or result.text or "(빈 응답)"
@@ -583,6 +597,8 @@ def _record(
         "ram_action": verdict.get("action"),
         "waited_s": int(waited_s),
         "tools_used": list(task.tools_used),
+        "tool_trace": list(task.tool_trace),
+        "completion_verified": False,
         "truncated": bool(task.truncated),
         "loops": task.loops,
         "effort": ctx.effort,
