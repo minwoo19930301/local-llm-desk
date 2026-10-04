@@ -17,6 +17,7 @@ import html
 import json
 import os
 import re
+import ssl
 import threading
 import urllib.request
 from datetime import datetime, timezone
@@ -201,11 +202,22 @@ def _manifest_gb(name: str, tag: str) -> float | None:
     return round(total / 1e9, 1) if total else None
 
 
+def ssl_context() -> ssl.SSLContext:
+    """회사 보안 게이트웨이(SSL 검사)가 내주는 인증서는 Python 3.13부터 기본으로 켜진 엄격 검사(VERIFY_X509_STRICT)에 걸린다.
+    인증서 체인과 호스트 이름 검증은 그대로 두고 엄격 검사만 끈다(3.12까지의 기본 동작)."""
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return ctx
+
+
+_SSL = ssl_context()
+
+
 def _get(url: str, timeout: float, accept: str = "") -> bytes:
     headers = {"User-Agent": USER_AGENT}
     if accept:
         headers["Accept"] = accept
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout, context=_SSL) as resp:
         return resp.read()
 
 
