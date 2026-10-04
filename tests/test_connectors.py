@@ -126,7 +126,9 @@ class ToolsTest(HermeticCase):
         with tempfile.TemporaryDirectory() as tmp:
             skill = Path(tmp) / "SKILL.md"
             skill.write_text("---\nname: demo\ndescription: 데모\n---\n\n# 본문\n\n" + "x" * 7000)
-            text = tools.system_prompt("read", 8, [{"kind": "skill", "name": "demo", "enabled": True, "path": str(skill)}])
+            # 작업 디렉터리 경로 길이(CI 러너·임시 폴더마다 다름)에 따라 결과가 달라지지 않도록 고정 경로로 측정한다.
+            with patch.object(tools, "_root_for", return_value=Path("/workspace")):
+                text = tools.system_prompt("read", 8, [{"kind": "skill", "name": "demo", "enabled": True, "path": str(skill)}])
             self.assertIn("## 스킬: demo", text)
             self.assertNotIn("description: 데모", text)
             self.assertLess(len(text), 6400)
