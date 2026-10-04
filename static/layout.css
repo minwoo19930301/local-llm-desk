@@ -293,6 +293,9 @@ button.gds-button {
 .when[hidden] { display: none !important; }
 
 .stack { display: flex; flex-direction: column; gap: 8px; }
+/* 긴 환경변수 이름이 좁은 화면에서 가로로 넘치지 않게 */
+.mail-help, .mail-help code { overflow-wrap: anywhere; }
+.mail-help code { font-family: ui-monospace, Menlo, monospace; font-size: 0.95em; }
 
 .note {
   width: 100%;
