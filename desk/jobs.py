@@ -26,7 +26,7 @@ PRESETS = {
 }
 ONCE_DELAYS = {"once_1m": 1, "once_5m": 5}
 WHEN_PRESETS = ("daily", "weekdays", "weekend", "custom")
-TOOL_KINDS = ("cli", "http", "chrome", "mcp")
+TOOL_KINDS = ("cli", "http", "chrome", "file", "mail", "mcp")
 
 PERMISSIONS = ("read", "workspace", "machine")
 EFFORTS = ("low", "medium", "high")

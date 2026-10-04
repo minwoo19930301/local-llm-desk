@@ -46,7 +46,9 @@ RUNS_KEEP_LINES = 500
 TOOL_RESULT_MAX_CHARS = 6000
 TOOL_RESULTS_TOTAL_CHARS = 24000
 TOOL_RESULTS_MAX_ENTRIES = 64
-STATUS_LABEL = {"ok": "성공", "fail": "실패", "skipped": "건너뜀", "deferred_timeout": "시간초과", "aborted": "중단됨", "empty": "빈 응답"}
+STATUS_LABEL = {"ok": "응답 완료 (작업 달성 미검증)", "fail": "실패", "skipped": "건너뜀", "deferred_timeout": "시간초과", "aborted": "중단됨", "empty": "빈 응답"}
+# 모델이 도구를 호출하는 대신 호출 JSON을 글로 출력한 경우(모델 응답 완료 ≠ 작업 달성).
+TEXTUAL_TOOL_CALL_RE = re.compile(r'"(?:name|function)"\s*:\s*"(?:run_cli|read_file|chrome_open|mail_headers|http_request)"')
 
 
 # --- 실행 컨텍스트 ------------------------------------------------------------
@@ -84,6 +86,9 @@ class TaskResult:
     tool_results_truncated: bool = False
     truncated: bool = False
     loops: int = 0
+    tool_trace: list[dict] = field(default_factory=list)
+    tool_errors: int = 0
+    incomplete: bool = False
 
     def note_tool(self, name: str) -> None:
         if name not in self.tools_used:
@@ -358,7 +363,13 @@ def _execute(ctx: RunContext, verdict: dict, waited_s: int) -> dict:
                        waited_s=waited_s, model_used=model_used, warnings=warnings)
     status, quality = _judge_output(task.text)
     warnings.extend(quality)
-    return _record(ctx, status, task=task, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
+    error = None
+    if status == "ok" and (task.tool_errors or task.incomplete):
+        # 응답이 있어도 도구 실패·미호출·호출 JSON만 출력이면 달성으로 보지 않는다. 빈 응답은 'empty'로 남긴다.
+        status = "fail"
+        error = "도구 실행 실패 또는 호출 미완료. 실행 내역을 확인하세요."
+        warnings.append("도구 실패 또는 실행 미완료: 작업 결과를 확인하세요.")
+    return _record(ctx, status, task=task, error=error, verdict=verdict, waited_s=waited_s, model_used=model_used, warnings=warnings)
 
 
 LIVE_INFO_RE = re.compile(r"오늘|최신|뉴스|날씨|지금|현재|실시간|어제|이번 주|주가|환율|속보")
@@ -528,20 +539,28 @@ def _desk_run(
             messages.append(msg)
             calls = ollama_ctl.extract_tool_calls(payload)
             if not calls:
+                # 도구를 골라 놓고도 쓰지 않았거나 호출 JSON만 글로 냈으면 미완료로 표시한다.
+                result.incomplete = (bool(spec) and not result.tools_used) or bool(TEXTUAL_TOOL_CALL_RE.search(result.text))
                 return result
             for call in calls:
                 budget.check()
                 failures_before = len(tool_context.failures)
+                began = time.monotonic()
                 try:
                     output = tools.run(call["name"], call.get("arguments") or {}, permission, clients,
                                        timeout=budget.remaining(), context=tool_context)
                 except Exception as exc:
                     result.note_tool(call["name"])
+                    result.tool_errors += 1
+                    result.tool_trace.append({"name": call["name"], "ok": False, "seconds": round(time.monotonic() - began, 3)})
                     result.note_tool_result(call["name"], str(exc) or type(exc).__name__, ok=False,
                                             error_type=type(exc).__name__, scrub=scrub)
                     raise
-                result.note_tool(call["name"])
+                # 실패 판정은 문자열 접두어가 아니라 ToolContext.failures(구조화된 실패 기록)로 한다.
                 failure = tool_context.failures[-1] if len(tool_context.failures) > failures_before else None
+                result.tool_errors += int(failure is not None)
+                result.tool_trace.append({"name": call["name"], "ok": failure is None, "seconds": round(time.monotonic() - began, 3)})
+                result.note_tool(call["name"])
                 result.note_tool_result(call["name"], output, ok=failure is None,
                                         error_type=failure.error_type if failure else None, scrub=scrub)
                 if failure:
@@ -551,9 +570,11 @@ def _desk_run(
                 messages.append(_tool_message(call, output))
             if _trim_transcript(messages, ctx_len):
                 result.truncated = True
+        # 도구 횟수를 다 쓰면 도구 없이 마지막 답을 받는다. 그때도 호출 JSON만 내놓으면 미완료다.
         payload = ollama_ctl.chat_messages(model, messages, effort=effort, num_ctx=ctx_len, timeout=budget.chat_timeout(effort))
         result.loops += 1
         result.text = ollama_ctl.extract_text(payload)
+        result.incomplete = bool(TEXTUAL_TOOL_CALL_RE.search(result.text))
         return result
     except Exception as exc:
         result.error = str(exc) or type(exc).__name__
@@ -699,6 +720,8 @@ def _record(
         "tool_results": evidence.tool_results,
         "tool_results_omitted": task.tool_results_omitted + evidence.tool_results_omitted,
         "tool_results_truncated": task.tool_results_truncated or evidence.tool_results_truncated,
+        "tool_trace": list(task.tool_trace),
+        "completion_verified": False,
         "truncated": bool(task.truncated),
         "loops": task.loops,
         "effort": ctx.effort,
