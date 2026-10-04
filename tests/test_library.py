@@ -115,6 +115,17 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(hardware.model_plan({"ram_gb": 24, "ram_free_gb": 5, "chip_gen": "m3", "chip_class": "base"}, builtin)["light"], "rare:3b")
 
 
+class SslTest(unittest.TestCase):
+    def test_context_still_verifies_but_not_strict(self) -> None:
+        """사내 보안 게이트웨이 인증서 때문에 엄격 검사만 끈다. 체인 검증과 호스트 이름 확인은 유지한다."""
+        import ssl
+
+        ctx = library.ssl_context()
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+        self.assertFalse(ctx.verify_flags & ssl.VERIFY_X509_STRICT)
+
+
 class SourceTest(unittest.TestCase):
     """갱신 → 캐시 → 기본 목록 순서. 모든 테스트에서 실제 네트워크는 막는다."""
 
