@@ -1,3 +1,4 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,13 +48,19 @@ class MailTests(unittest.TestCase):
 
 class ToolTests(unittest.TestCase):
     def test_cli_real_success_and_failure(self):
+        # tools.run fails closed without the per-run ToolContext; select CLI the way a job would.
+        context = tools.build_context('workspace', ['cli'], [], {})
         with tempfile.TemporaryDirectory() as tmp, patch.object(tools,'WORKSPACE',Path(tmp)):
-            self.assertEqual(tools.run('run_cli',{'command':'printf tool-ok'},'workspace',{}),'tool-ok')
-            self.assertTrue(tools.run('run_cli',{'command':'exit 7'},'workspace',{}).startswith('도구 실패:'))
+            self.assertEqual(tools.run('run_cli',{'command':'echo tool-ok'},'workspace',{},context=context),'tool-ok')
+            if sys.platform == 'darwin' and Path('/usr/bin/sandbox-exec').exists():
+                # External executables run only inside the macOS sandbox.
+                self.assertEqual(tools.run('run_cli',{'command':'printf tool-ok'},'workspace',{},context=context),'tool-ok')
+            self.assertTrue(tools.run('run_cli',{'command':'exit 7'},'workspace',{},context=context).startswith('도구 실패:'))
 
     def test_browser_open_does_not_claim_reading(self):
+        context = tools.build_context('workspace', ['chrome'], [], {})
         with patch.object(tools.subprocess,'run',return_value=MagicMock(returncode=0)):
-            result=tools.run('chrome_open',{'url':'https://mail.naver.com/'},'workspace',{})
+            result=tools.run('chrome_open',{'url':'https://mail.naver.com/'},'workspace',{},context=context)
         self.assertIn('확인하지 못했습니다',result)
 
     def test_selected_tools(self):
@@ -70,7 +77,8 @@ class ToolTests(unittest.TestCase):
 
     def test_unselected_tool_is_not_executed(self):
         responses=[{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"run_cli","arguments":{"command":"echo forbidden"}}}]}}, {"message":{"role":"assistant","content":"Done"}}]
-        with patch.object(runner.ollama_ctl,"chat_messages",side_effect=responses), patch.object(tools,"run") as dispatch:
+        # The allow-list is enforced inside tools.run (ToolContext), so observe the executor itself.
+        with patch.object(runner.ollama_ctl,"chat_messages",side_effect=responses), patch.object(tools,"_run_cli") as dispatch:
             result=runner.run_task("test","read file",tools=["file"],max_loops=4)
         dispatch.assert_not_called(); self.assertEqual(result.tool_errors,1)
 

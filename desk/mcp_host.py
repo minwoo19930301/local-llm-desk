@@ -17,6 +17,7 @@ import signal
 import socket
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -400,6 +401,7 @@ class MCPClient:
         return headers
 
     def _http_roundtrip(self, msg: dict, timeout: float, expect_id: Any) -> dict:
+        deadline = time.monotonic() + max(0.001, timeout)
         url = self._url
         body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=self._http_headers(), method="POST")
@@ -410,7 +412,7 @@ class MCPClient:
                     self._session_id = sid
                 if expect_id is None:
                     return {}
-                return self._http_read_reply(resp, expect_id, timeout)
+                return self._http_read_reply(resp, expect_id, timeout, deadline)
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise MCPError(f"인증 필요: {_redact(url)}") from exc
@@ -423,11 +425,16 @@ class MCPClient:
         except (urllib.error.URLError, OSError) as exc:
             raise MCPClosed(f"MCP 서버 '{self.name}' 연결 실패: {getattr(exc, 'reason', exc)}") from exc
 
-    def _http_read_reply(self, resp: Any, expect_id: Any, timeout: float) -> dict:
+    def _http_read_reply(self, resp: Any, expect_id: Any, timeout: float, deadline: float | None = None) -> dict:
+        deadline = deadline if deadline is not None else time.monotonic() + timeout
         ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype == "text/event-stream":
-            return self._read_sse(resp, expect_id, timeout)
-        raw = resp.read()
+            return self._read_sse(resp, expect_id, timeout, deadline)
+        raw = b""
+        for chunk in self._http_chunks(resp, deadline, timeout):
+            raw += chunk
+            if len(raw) > 8 * 1024 * 1024:
+                raise MCPError("MCP 응답이 8 MiB 제한을 초과했습니다.")
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -437,25 +444,48 @@ class MCPClient:
             raise MCPError(f"MCP 서버 '{self.name}' 응답에 id={expect_id} 가 없습니다.")
         return reply
 
-    def _read_sse(self, resp: Any, expect_id: Any, timeout: float) -> dict:
-        """`data:` 라인들을 이벤트 단위로 모아 id 가 맞는 JSON-RPC 응답을 찾는다."""
+    def _http_chunks(self, resp: Any, deadline: float, timeout: float):
+        """One socket read per iteration, including partial SSE lines, within one deadline."""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MCPTimeout(f"MCP 서버 '{self.name}' 응답 없음 ({timeout:g}s)")
+            sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+            if sock is not None:
+                sock.settimeout(remaining)
+            chunk = resp.read1(4096)
+            if time.monotonic() >= deadline:
+                raise MCPTimeout(f"MCP 서버 '{self.name}' 응답 없음 ({timeout:g}s)")
+            if not chunk:
+                return
+            yield chunk
+
+    def _read_sse(self, resp: Any, expect_id: Any, timeout: float, deadline: float | None = None) -> dict:
+        """Heartbeats and partial lines do not reset the total response deadline."""
+        deadline = deadline if deadline is not None else time.monotonic() + timeout
         data_lines: list[str] = []
+        pending = b""
+        size = 0
         try:
-            while True:
-                line = resp.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if text.startswith("data:"):
-                    data_lines.append(text[5:].lstrip())
-                    continue
-                if text == "" and data_lines:
-                    reply = self._sse_event(data_lines, expect_id)
-                    data_lines = []
-                    if reply is not None:
-                        return reply
+            for chunk in self._http_chunks(resp, deadline, timeout):
+                pending += chunk
+                size += len(chunk)
+                if size > 8 * 1024 * 1024:
+                    raise MCPError("MCP SSE 응답이 8 MiB 제한을 초과했습니다.")
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    text = line.decode("utf-8", errors="replace").rstrip("\r")
+                    if text.startswith("data:"):
+                        data_lines.append(text[5:].lstrip())
+                    elif text == "" and data_lines:
+                        reply = self._sse_event(data_lines, expect_id)
+                        data_lines = []
+                        if reply is not None:
+                            return reply
         except (socket.timeout, TimeoutError) as exc:
-            raise MCPTimeout(f"MCP 서버 '{self.name}' 응답 없음 ({timeout:.0f}s)") from exc
+            raise MCPTimeout(f"MCP 서버 '{self.name}' 응답 없음 ({timeout:g}s)") from exc
+        if pending.startswith(b"data:"):
+            data_lines.append(pending[5:].decode("utf-8", errors="replace").strip())
         if data_lines:
             reply = self._sse_event(data_lines, expect_id)
             if reply is not None:

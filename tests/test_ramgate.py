@@ -120,11 +120,12 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(verdict["action"], "skip")
         self.assertIn("램 부족", verdict["reason"])
 
-    def test_pressure_blocks_regardless_of_room(self) -> None:
+    def test_pressure_warns_but_runs_when_memory_fits(self) -> None:
         with mock.patch.object(ramgate, "snapshot", return_value=_snapshot(avail=20.0, pressure=2)):
-            self.assertEqual(ramgate.decide("deepseek-r1:7b", "defer")["action"], "wait")
-            self.assertEqual(ramgate.decide("deepseek-r1:7b", "skip")["action"], "skip")
-            self.assertEqual(ramgate.decide("deepseek-r1:7b", "downgrade")["action"], "downgrade")
+            for policy in ("defer", "skip", "downgrade"):
+                verdict = ramgate.decide("deepseek-r1:7b", policy)
+                self.assertEqual(verdict["action"], "run")
+                self.assertIn("메모리 압력 높음", verdict["reason"])
 
     def test_gate_factor_and_margin(self) -> None:
         self.assertTrue(ramgate._fits(3.2, 4.5, 0.5))  # 3.52 <= 4.0

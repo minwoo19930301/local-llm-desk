@@ -58,15 +58,8 @@ def setup(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 def _provider_ready() -> bool:
-    if ollama_ctl.running():
-        return True
-    if not (ollama_ctl.app_installed() or ollama_ctl.binary()):
-        return False
-    try:
-        ollama_ctl.start()
-    except Exception:
-        return False
-    return ollama_ctl.wait_until_up(20)
+    # Installation does not require a running background server.
+    return bool(ollama_ctl.binary())
 
 
 def _setup_providers(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -77,6 +70,8 @@ def _setup_providers(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     warnings: list[str] = []
     if "ollama" in providers:
         _check()
+        # Migrate only Desk's obsolete login agent. This never starts Ollama.
+        ollama_ctl.ensure_background()
         yield _log("Ollama", progress=4, stage="Ollama")
         for ev in _ensure_ollama():
             _check()
@@ -85,12 +80,8 @@ def _setup_providers(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 _cleanup_tmp()
                 yield {"event": "done", "ok": False, "error": ev.get("line") or "Ollama 설치 실패"}
                 return
-        try:
-            ollama_ctl.ensure_background()
-        except Exception:
-            pass
         if not _provider_ready():
-            yield {"event": "done", "ok": False, "error": "Ollama는 받았지만 서버가 안 켜졌습니다. 다시 시도하세요."}
+            yield {"event": "done", "ok": False, "error": "Ollama 실행 파일을 확인하지 못했습니다. 다시 설치하세요."}
             return
         yield _log("Ollama 준비됨", progress=50, stage="Ollama")
     if "llamacpp" in providers:
@@ -119,7 +110,7 @@ def _setup_providers(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
             yield _log("MLX 완료", progress=95, stage="MLX")
     ready = _provider_ready() if "ollama" in providers else True
     if "ollama" in providers and not ready:
-        yield {"event": "done", "ok": False, "error": "Ollama 서버가 꺼져 있습니다. 다시 시도하세요."}
+        yield {"event": "done", "ok": False, "error": "Ollama 실행 파일이 없습니다. 다시 설치하세요."}
         return
     yield _log("완료", progress=100, stage="Ollama")
     yield {
@@ -135,71 +126,68 @@ def _setup_models(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if not _provider_ready():
         yield {"event": "done", "ok": False, "error": "먼저 프로바이더를 받으세요."}
         return
-    allowed = allowed_models()
-    models = [n for n in (body.get("models") or []) if n in allowed]
-    agents = list(body.get("agents") or [])
-    if not models and not agents:
-        yield {"event": "done", "ok": False, "error": "모델을 하나 고르세요."}
-        return
-    n = max(1, len(models))
-    for i, name in enumerate(models):
-        _check()
-        base = int(90 * i / n)
-        if ollama_ctl.has_model(name):
-            yield _log(f"{name} 있음", progress=int(90 * (i + 1) / n), stage=name)
-            continue
-        yield _log(f"{name} 받는 중", progress=base, stage=name)
-        for line in ollama_ctl.pull_model(name):
+    with ollama_ctl.session(cancel=cancelled):
+        allowed = allowed_models()
+        models = [n for n in (body.get("models") or []) if n in allowed]
+        agents = list(body.get("agents") or [])
+        if not models and not agents:
+            yield {"event": "done", "ok": False, "error": "모델을 하나 고르세요."}
+            return
+        n = max(1, len(models))
+        for i, name in enumerate(models):
             _check()
-            pct = _pct(line)
-            mapped = base + int((90 / n) * (pct / 100)) if pct is not None else None
-            ev = _from_pipe(line, name, mapped)
-            if ev:
-                yield ev
-        yield _log(f"{name} 완료", progress=int(90 * (i + 1) / n), stage=name)
-    for agent in agents:
-        _check()
-        if agent == "desk":
-            continue
-        if agent == "open-webui":
-            for ev in _install_open_webui():
-                yield ev
-                if ev.get("event") == "error":
-                    yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
-                    return
-        elif agent == "aider":
-            for ev in _install_aider():
-                yield ev
-                if ev.get("event") == "error":
-                    yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
-                    return
-        elif agent == "opencode":
-            for ev in _install_opencode():
-                yield ev
-                if ev.get("event") == "error":
-                    yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
-                    return
-        else:
-            yield _log(f"이 화면에서 설치 불가: {agent}")
-    have_models = bool(ollama_ctl.list_models())
-    if have_models:
+            base = int(90 * i / n)
+            if ollama_ctl.has_model(name):
+                yield _log(f"{name} 있음", progress=int(90 * (i + 1) / n), stage=name)
+                continue
+            yield _log(f"{name} 받는 중", progress=base, stage=name)
+            for line in ollama_ctl.pull_model(name):
+                _check()
+                pct = _pct(line)
+                mapped = base + int((90 / n) * (pct / 100)) if pct is not None else None
+                ev = _from_pipe(line, name, mapped)
+                if ev:
+                    yield ev
+            yield _log(f"{name} 완료", progress=int(90 * (i + 1) / n), stage=name)
+        for agent in agents:
+            _check()
+            if agent == "desk":
+                continue
+            if agent == "open-webui":
+                for ev in _install_open_webui():
+                    yield ev
+                    if ev.get("event") == "error":
+                        yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
+                        return
+            elif agent == "aider":
+                for ev in _install_aider():
+                    yield ev
+                    if ev.get("event") == "error":
+                        yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
+                        return
+            elif agent == "opencode":
+                for ev in _install_opencode():
+                    yield ev
+                    if ev.get("event") == "error":
+                        yield {"event": "done", "ok": False, "error": ev.get("line") or "에이전트 실패"}
+                        return
+            else:
+                yield _log(f"이 화면에서 설치 불가: {agent}")
+        have_models = bool(ollama_ctl.list_models())
         ollama_ctl.remember_models()
-    cfg = load_config()
-    cfg["setup_done"] = have_models
-    save_config(cfg)
-    ollama_ctl.stop()
+        from desk.state import locked
+        with locked():
+            cfg = load_config()
+            cfg["setup_done"] = have_models
+            save_config(cfg)
     yield _log("완료", progress=100)
     yield {"event": "done", "ok": True, "ready": have_models}
 
 
 def _cleanup_tmp() -> None:
-    for path in ("/tmp/Ollama.dmg",):
-        try:
-            if os.path.isfile(path):
-                os.remove(path)
-        except OSError:
-            pass
-    subprocess.run(["hdiutil", "detach", "/tmp/ollama-mnt", "-quiet", "-force"], capture_output=True)
+    # Each installation owns a TemporaryDirectory; never detach/delete a
+    # predictable shared /tmp path that might belong to another process.
+    pass
 
 
 def remove(names: list[str]) -> Iterator[dict[str, Any]]:
@@ -211,14 +199,15 @@ def remove(names: list[str]) -> Iterator[dict[str, Any]]:
         yield {"event": "done", "ok": False}
         return
     try:
-        ollama_ctl.start()
-        ollama_ctl.wait_until_up(20)
-        for name in names:
-            if not ollama_ctl.has_model(name):
-                yield _log(f"{name} 없음")
-                continue
-            ollama_ctl.remove_model(name)
-            yield _log(f"{name} 지움")
+        with ollama_ctl.session(cancel=cancelled):
+            for name in names:
+                _check()
+                if not ollama_ctl.has_model(name):
+                    yield _log(f"{name} 없음")
+                    continue
+                ollama_ctl.remove_model(name)
+                yield _log(f"{name} 지움")
+            ollama_ctl.remember_models()
         yield {"event": "done", "ok": True}
     except Exception as exc:
         yield _log(str(exc))
@@ -317,12 +306,8 @@ def _install_mlx() -> Iterator[dict[str, Any]]:
 
 
 def _ensure_ollama() -> Iterator[dict[str, Any]]:
-    if ollama_ctl.app_installed() or ollama_ctl.binary():
-        ollama_ctl.start()
-        if not ollama_ctl.wait_until_up(45):
-            yield {"event": "error", "line": "Ollama 앱이 안 떠 있습니다."}
-            return
-        yield _log("Ollama 앱 켜짐", progress=18, stage="Ollama")
+    if ollama_ctl.binary():
+        yield _log("Ollama 설치됨 · 실행할 때 켜집니다", progress=18, stage="Ollama")
         return
     if sys.platform == "darwin":
         for ev in _install_ollama_app():
@@ -339,14 +324,10 @@ def _ensure_ollama() -> Iterator[dict[str, Any]]:
     else:
         yield {"event": "error", "line": "이 OS의 Ollama 앱 설치는 아직 없습니다. ollama.com에서 받아 주세요."}
         return
-    if not (ollama_ctl.app_installed() or ollama_ctl.binary()):
-        yield {"event": "error", "line": "Ollama 앱 설치를 확인하지 못했습니다."}
+    if not ollama_ctl.binary():
+        yield {"event": "error", "line": "Ollama 실행 파일을 확인하지 못했습니다."}
         return
-    ollama_ctl.start()
-    if not ollama_ctl.wait_until_up(45):
-        yield {"event": "error", "line": "Ollama 앱이 안 떠 있습니다."}
-        return
-    yield _log("Ollama 앱 켜짐", progress=18, stage="Ollama")
+    yield _log("Ollama 설치됨 · 실행할 때 켜집니다", progress=18, stage="Ollama")
 
 
 def _download_file(url: str, dest: str, stage: str) -> Iterator[dict[str, Any]]:
@@ -380,38 +361,40 @@ def _download_file(url: str, dest: str, stage: str) -> Iterator[dict[str, Any]]:
 def _install_ollama_app() -> Iterator[dict[str, Any]]:
     from pathlib import Path
 
-    dmg = "/tmp/Ollama.dmg"
-    mnt = "/tmp/ollama-mnt"
-    for ev in _download_file("https://ollama.com/download/Ollama.dmg", dmg, "Ollama"):
-        yield ev
-    _check()
-    yield _log("Ollama 앱 설치", progress=70, stage="Ollama")
-    subprocess.run(["hdiutil", "detach", mnt], capture_output=True)
-    attach = subprocess.run(
-        ["hdiutil", "attach", dmg, "-nobrowse", "-mountpoint", mnt],
-        capture_output=True,
-        text=True,
-    )
-    if attach.returncode != 0:
-        yield {"event": "error", "line": "Ollama 디스크 이미지를 열지 못했습니다."}
-        return
-    try:
-        src = Path(mnt) / "Ollama.app"
-        if not src.exists():
-            yield {"event": "error", "line": "이미지에 Ollama.app이 없습니다."}
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="local-llm-desk-ollama-") as tmp:
+        dmg = str(Path(tmp) / "Ollama.dmg")
+        mnt = str(Path(tmp) / "mount")
+        for ev in _download_file("https://ollama.com/download/Ollama.dmg", dmg, "Ollama"):
+            yield ev
+        _check()
+        yield _log("Ollama 앱 설치", progress=70, stage="Ollama")
+        attach = subprocess.run(
+            ["hdiutil", "attach", dmg, "-nobrowse", "-mountpoint", mnt],
+            capture_output=True,
+            text=True,
+        )
+        if attach.returncode != 0:
+            yield {"event": "error", "line": "Ollama 디스크 이미지를 열지 못했습니다."}
             return
-        dest = Path("/Applications/Ollama.app")
-        copy = subprocess.run(["ditto", str(src), str(dest)], capture_output=True, text=True)
-        if copy.returncode != 0:
-            dest = Path.home() / "Applications" / "Ollama.app"
-            dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            src = Path(mnt) / "Ollama.app"
+            if not src.exists():
+                yield {"event": "error", "line": "이미지에 Ollama.app이 없습니다."}
+                return
+            dest = Path("/Applications/Ollama.app")
             copy = subprocess.run(["ditto", str(src), str(dest)], capture_output=True, text=True)
             if copy.returncode != 0:
-                yield {"event": "error", "line": copy.stderr.strip() or "Ollama.app을 복사하지 못했습니다."}
-                return
-        yield _log("Ollama 앱 설치됨", progress=90, stage="Ollama")
-    finally:
-        subprocess.run(["hdiutil", "detach", mnt, "-quiet"], capture_output=True)
+                dest = Path.home() / "Applications" / "Ollama.app"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                copy = subprocess.run(["ditto", str(src), str(dest)], capture_output=True, text=True)
+                if copy.returncode != 0:
+                    yield {"event": "error", "line": copy.stderr.strip() or "Ollama.app을 복사하지 못했습니다."}
+                    return
+            yield _log("Ollama 앱 설치됨", progress=90, stage="Ollama")
+        finally:
+            subprocess.run(["hdiutil", "detach", mnt, "-quiet"], capture_output=True)
 
 
 def _install_ollama_windows() -> Iterator[dict[str, Any]]:

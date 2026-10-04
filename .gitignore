@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv/
+node_modules/
+test-results/
 static/gds.css
 static/fonts/

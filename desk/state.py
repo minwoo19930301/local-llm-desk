@@ -20,7 +20,8 @@ from typing import Any, Iterator
 
 from desk.paths import CONFIG_FILE, JOBS_FILE, LOCK_FILE, ensure_dirs
 
-DEFAULT_ALERTS: dict[str, Any] = {"macos": True, "sound": True, "webhook": ""}
+MACOS_ALERT_MODES = ("notification", "dialog", "window")
+DEFAULT_ALERTS: dict[str, Any] = {"macos": True, "macos_mode": "notification", "sound": True, "webhook": ""}
 DEFAULT_CONNECTIONS: dict[str, bool] = {"cli": False, "http": False, "chrome": False}
 LOCK_TIMEOUT_S = 30.0
 

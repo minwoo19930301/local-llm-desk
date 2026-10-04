@@ -42,8 +42,8 @@ def _status_model(have: bool, tight_ram: bool, tight_disk: bool) -> str:
 
 def installed_sizes() -> dict[str, float | None]:
     """Installed model name → size in GB (exact from /api/tags; None when only remembered)."""
-    live = ollama_ctl.list_models()
-    if live:
+    live = ollama_ctl.model_inventory()
+    if live is not None:
         sizes = {(m.get("name") or m.get("model") or ""): round(int(m.get("size") or 0) / GIB, 1) for m in live}
         sizes.pop("", None)
         names = sorted(sizes)
