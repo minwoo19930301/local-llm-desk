@@ -453,7 +453,7 @@ async function route() {
   if (path === "/install/models") {
     if (!providerReady && !ready) return go("/install", true);
     showView("viewModels");
-    if (typeof load === "function") await load();
+    if (typeof load === "function") await load({ fresh: true });
     return;
   }
   if (path === "/install") {
@@ -789,7 +789,7 @@ async function runModels(status) {
     ui.pick.style.animation = "";
   }
   window.welcomeOnSplash = true;
-  if (typeof load === "function") await load();
+  if (typeof load === "function") await load({ fresh: true });
 }
 
 /* ---------- edit form: models / tools / connectors ---------- */

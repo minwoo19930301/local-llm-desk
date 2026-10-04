@@ -176,7 +176,7 @@ def _need_bytes(model: str, weights: int, num_ctx: int) -> int:
 
 
 def _weight_bytes(model: str) -> int:
-    """/api/tags size → manifest 레이어 합 → hardware.ALL_MODELS size_gb → 0."""
+    """/api/tags size → manifest 레이어 합 → 받을 모델 목록 캐시(desk.library) → hardware.ALL_MODELS size_gb → 0."""
     for row in _tags():
         if (row.get("name") or row.get("model")) == model:
             return int(row.get("size") or 0)
@@ -185,6 +185,11 @@ def _weight_bytes(model: str) -> int:
         layers = manifest.get("layers") or []
         config = manifest.get("config") or {}
         return sum(int(layer.get("size") or 0) for layer in layers) + int(config.get("size") or 0)
+    from desk import library
+
+    cached = library.cached_size_gb(model)
+    if cached:
+        return int(float(cached) * 1000**3)
     for row in hardware.ALL_MODELS:
         if row["id"] == model:
             return int(float(row["size_gb"]) * 1000**3)

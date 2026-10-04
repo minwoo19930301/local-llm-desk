@@ -52,6 +52,14 @@ class ApiIntegration(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/jobs", {}, {"X-Requested-With": "free-ai-scheduler", "Origin": "http://evil.invalid"})[0], 403)
         self.assertEqual(self.request("GET", "/static/../desk/http_api.py")[0], 404)
 
+    def test_catalog_fresh_only_when_asked(self):
+        """설치 화면만 ?fresh=1로 ollama.com 목록을 새로 읽게 한다. 작업 폼 등 나머지는 캐시만."""
+        build = http_api.catalog.build
+        self.assertEqual(self.request("GET", "/api/catalog?fresh=1")[0], 200)
+        self.assertEqual(build.call_args.kwargs, {"fresh": True})
+        self.assertEqual(self.request("GET", "/api/catalog")[0], 200)
+        self.assertEqual(build.call_args.kwargs, {"fresh": False})
+
     def test_status_does_not_start_ollama(self):
         with mock.patch.object(http_api.ollama_ctl, "start", side_effect=AssertionError("Must stay idle")):
             self.assertEqual(self.request("GET", "/api/status")[0], 200)

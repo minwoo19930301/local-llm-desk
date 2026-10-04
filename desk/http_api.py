@@ -383,7 +383,7 @@ def _ram(req: Request) -> Result:
 
 @route("GET", r"/api/catalog")
 def _catalog(req: Request) -> Result:
-    return 200, catalog.build()
+    return 200, catalog.build(fresh=req.q("fresh") == "1")
 
 
 # ── jobs ─────────────────────────────────────────────────────────────────────
