@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from desk import ollama_ctl
+from desk import library, ollama_ctl
 from desk.hardware import detect, model_plan, org_of, role_label
 from desk.paths import DATA
 from desk.state import load_config
@@ -164,9 +164,11 @@ def _agents() -> list[dict[str, Any]]:
     ]
 
 
-def build() -> dict[str, Any]:
+def build(fresh: bool = False) -> dict[str, Any]:
+    """설치 화면 데이터. fresh면 받을 수 있는 모델 목록을 ollama.com에서 새로 읽는다(desk.library)."""
     hw = detect()
-    plan = model_plan(hw)
+    rows, source = library.models(int(hw["ram_gb"]), fresh=fresh)
+    plan = model_plan(hw, rows)
     sizes = installed_sizes()
     models = [_model_row(item, sizes) for item in plan["models"]]
     known = {m["id"] for m in models}
@@ -177,6 +179,7 @@ def build() -> dict[str, Any]:
         "plan": plan,
         "providers": _providers(hw),
         "models": models,
+        "library": source,
         "agents": _agents(),
         "legend": "숫자는 이 모델이 쓰는 디스크·램입니다. 빠듯함은 지금 남은 용량 기준입니다.",
         "ollama": {

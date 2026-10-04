@@ -7,7 +7,7 @@ import tempfile
 import threading
 from unittest import mock
 
-from desk import alerts, catalog, connectors, crontab_sync, http_api, installer, jobs, mcp_host, ollama_ctl, paths, ramgate, runner, state, tools
+from desk import alerts, catalog, connectors, crontab_sync, http_api, installer, jobs, library, mcp_host, ollama_ctl, paths, ramgate, runner, state, tools
 
 
 @contextmanager
@@ -15,7 +15,7 @@ def isolated_server():
     with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
         old_data = paths.DATA
         data = Path(tmp) / "data"
-        for module in (paths, state, jobs, connectors, runner, ollama_ctl, http_api, catalog, tools):
+        for module in (paths, state, jobs, connectors, runner, ollama_ctl, http_api, catalog, tools, library):
             for name, value in list(vars(module).items()):
                 if isinstance(value, Path) and value.is_relative_to(old_data):
                     stack.enter_context(mock.patch.object(module, name, data / value.relative_to(old_data)))

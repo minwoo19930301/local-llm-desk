@@ -8,27 +8,28 @@ import subprocess
 import sys
 from typing import Any
 
-# size_gb: ollama.com library Q4 기준. min_ram: 이 이하면 목록에서 뺌.
+# 인터넷이 안 될 때만 쓰는 기본 목록. 평소에는 desk.library가 ollama.com에서 가져온다.
+# size_gb: 레지스트리 manifest 레이어 합(10/3 측정). min_ram: library.min_ram과 같은 규칙.
 ALL_MODELS: list[dict[str, Any]] = [
     {"id": "llama3.2:1b", "role": "빠른 답", "size_gb": 1.3, "min_ram": 8},
     {"id": "llama3.2:3b", "role": "빠른 답", "size_gb": 2.0, "min_ram": 8},
     {"id": "qwen3.5:2b", "role": "빠른 답", "size_gb": 2.7, "min_ram": 8},
     {"id": "qwen3.5:4b", "role": "빠른 답", "size_gb": 3.4, "min_ram": 8},
+    {"id": "gemma4:e2b", "role": "빠른 답", "size_gb": 4.6, "min_ram": 8},
     {"id": "deepseek-r1:7b", "role": "추론·코딩", "size_gb": 4.7, "min_ram": 8},
     {"id": "qwen2.5-coder:7b", "role": "추론·코딩", "size_gb": 4.7, "min_ram": 8},
     {"id": "qwen3.5:9b", "role": "빠른 답", "size_gb": 6.6, "min_ram": 16},
-    {"id": "gemma4:e2b", "role": "빠른 답", "size_gb": 7.2, "min_ram": 16},
-    {"id": "gemma4:12b", "role": "빠른 답", "size_gb": 7.6, "min_ram": 16},
+    {"id": "gemma4:e4b", "role": "빠른 답", "size_gb": 6.6, "min_ram": 16},
+    {"id": "gemma4:12b", "role": "빠른 답", "size_gb": 8.0, "min_ram": 16},
     {"id": "qwen2.5-coder:14b", "role": "추론·코딩", "size_gb": 9.0, "min_ram": 16},
     {"id": "deepseek-r1:14b", "role": "추론·코딩", "size_gb": 9.0, "min_ram": 16},
-    {"id": "gemma4:e4b", "role": "빠른 답", "size_gb": 9.6, "min_ram": 16},
-    {"id": "qwen3.6:27b", "role": "추론·코딩", "size_gb": 17.0, "min_ram": 24},
-    {"id": "qwen3.5:27b", "role": "추론·코딩", "size_gb": 17.0, "min_ram": 24},
-    {"id": "gemma4:26b", "role": "추론·코딩", "size_gb": 18.0, "min_ram": 24},
+    {"id": "qwen3.5:27b", "role": "추론·코딩", "size_gb": 17.4, "min_ram": 24},
+    {"id": "qwen3.6:27b", "role": "추론·코딩", "size_gb": 17.8, "min_ram": 24},
+    {"id": "gemma4:26b", "role": "추론·코딩", "size_gb": 18.7, "min_ram": 24},
     {"id": "glm-4.7-flash", "role": "추론·코딩", "size_gb": 19.0, "min_ram": 24},
-    {"id": "gemma4:31b", "role": "추론·코딩", "size_gb": 20.0, "min_ram": 24},
-    {"id": "deepseek-r1:32b", "role": "추론·코딩", "size_gb": 20.0, "min_ram": 24},
-    {"id": "qwen3.6:35b", "role": "추론·코딩", "size_gb": 24.0, "min_ram": 48},
+    {"id": "deepseek-r1:32b", "role": "추론·코딩", "size_gb": 19.9, "min_ram": 24},
+    {"id": "gemma4:31b", "role": "추론·코딩", "size_gb": 20.4, "min_ram": 24},
+    {"id": "qwen3.6:35b", "role": "추론·코딩", "size_gb": 22.6, "min_ram": 32},
 ]
 
 
@@ -230,14 +231,19 @@ def ram_band(ram_gb: int) -> str:
     return "8gb"
 
 
-def models_for(hw: dict[str, Any] | int) -> list[dict[str, Any]]:
+def models_for(hw: dict[str, Any] | int, rows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """받을 수 있는 모델 행. rows가 없으면 desk.library의 마지막 목록(없으면 기본 목록)을 쓴다. 네트워크는 쓰지 않는다."""
     if isinstance(hw, int):
         hw = {"ram_gb": hw, "chip_gen": "m3", "chip_class": "base", "usable_gb": usable_ram(hw, "m3", "base")}
     ram = int(hw["ram_gb"])
+    if rows is None:
+        from desk import library
+
+        rows, _ = library.models(ram)
     ram_free = float(hw.get("ram_free_gb") or hw.get("usable_gb") or usable_ram(ram, hw.get("chip_gen") or "m3", hw.get("chip_class") or "base"))
     disk_free = float(hw.get("disk_free_gb") or 0)
     out: list[dict[str, Any]] = []
-    for src in ALL_MODELS:
+    for src in rows:
         m = dict(src)
         if m.get("skip"):
             continue
@@ -260,7 +266,12 @@ def models_for(hw: dict[str, Any] | int) -> list[dict[str, Any]]:
 
 def _mark_picks(models: list[dict[str, Any]], usable: int) -> None:
     def nearest(rows: list[dict[str, Any]], target: float) -> dict[str, Any]:
-        return min(rows, key=lambda m: abs(float(m["size_gb"]) - target))
+        """목표 크기 근처에서는 많이 받는 모델, 근처에 없으면 가장 가까운 모델. 다운로드 수가 없으면(기본 목록) 가장 가까운 것."""
+        gap = lambda m: abs(float(m["size_gb"]) - target)  # noqa: E731
+        near = [m for m in rows if gap(m) <= max(1.0, target * 0.35)]
+        if near:
+            return max(near, key=lambda m: (int(m.get("pulls") or 0), -gap(m)))
+        return min(rows, key=gap)
 
     fast = [m for m in models if m.get("role") == "빠른 답" and not m.get("skip") and not m.get("tight")]
     smart = [m for m in models if m.get("role") == "추론·코딩" and not m.get("skip") and not m.get("tight")]
@@ -272,13 +283,13 @@ def _mark_picks(models: list[dict[str, Any]], usable: int) -> None:
         nearest(smart, usable * 0.9)["pick"] = True
 
 
-def model_plan(hw: dict[str, Any] | int) -> dict[str, Any]:
+def model_plan(hw: dict[str, Any] | int, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     if isinstance(hw, int):
-        models = models_for(hw)
+        models = models_for(hw, rows)
         ram = hw
         label = f"램 {ram}GB 기준"
     else:
-        models = models_for(hw)
+        models = models_for(hw, rows)
         ram = int(hw["ram_gb"])
         label = hw.get("recommend_label") or f"램 {ram}GB 기준"
     runnable = [m for m in models if not m.get("skip")]

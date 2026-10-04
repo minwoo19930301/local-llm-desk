@@ -139,8 +139,16 @@ function setProgress(pct, stage) {
   if (progressWhat && stage) progressWhat.textContent = stage;
 }
 
-async function load() {
-  const cat = await fetch("/api/catalog").then((r) => r.json());
+function showModelSource(text) {
+  for (const el of [modelHintEl, document.getElementById("seekModelHint")]) {
+    if (el) el.textContent = text;
+  }
+}
+
+// fresh: 받을 모델 목록을 보여주기 직전에 ollama.com 목록을 새로 읽는다(서버가 10분 캐시).
+async function load(opts = {}) {
+  if (opts.fresh) showModelSource("최신 모델 목록을 확인하는 중…");
+  const cat = await fetch(opts.fresh ? "/api/catalog?fresh=1" : "/api/catalog").then((r) => r.json());
   const all = asItems(cat.models || [], "model");
   const have = (cat.models || []).filter((m) => m.installed);
   const haveEl = document.getElementById("haveModels");
@@ -162,6 +170,7 @@ async function load() {
   const fresh = all.filter((i) => !i.installed);
   DD.mount("modelDrop", { label: "더 받을 모델", multi: true, items: fresh.length ? fresh : all });
   DD.mount("seekModelDrop", { label: "더 받을 모델", multi: true, items: fresh.length ? fresh : all });
+  showModelSource((cat.library && cat.library.label) || "");
   window.installState = {
     provider: !!(ollama && ollama.installed),
     modelCount: have.length,
